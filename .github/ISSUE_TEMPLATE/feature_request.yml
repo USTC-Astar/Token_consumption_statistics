@@ -1,0 +1,25 @@
+name: 功能建议
+description: 提议新的统计指标、平台支持或交互改进
+title: "[Feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 使用场景
+      description: 这个功能要解决什么问题？
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      description: 描述期望的统计口径或交互方式。
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 已考虑的替代方案

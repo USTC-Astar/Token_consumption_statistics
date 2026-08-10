@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Codex 流量统计</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="app-mark"><span></span><span></span><span></span><span></span></div>
+        <div>
+          <div class="eyebrow">CODEX TRAFFIC STUDIO</div>
+          <h1>Codex 流量统计</h1>
+          <p id="subtitle">正在读取本机与远程设备数据…</p>
+        </div>
+      </div>
+      <div class="actions">
+        <select id="devicePicker" aria-label="设备筛选"></select>
+        <div class="segmented" id="rangePicker">
+          <button data-period="today">今天</button>
+          <button data-period="yesterday">昨天</button>
+          <button data-period="7">7 天</button>
+          <button data-period="30" class="active">30 天</button>
+          <button data-period="90">90 天</button>
+          <button data-period="all">全部</button>
+        </div>
+        <button class="icon-button" id="refreshButton" title="刷新数据">↻</button>
+        <button class="settings-button" id="settingsButton">⚙ 设备与同步</button>
+      </div>
+    </header>
+
+    <section id="loading" class="loading-card">
+      <div class="spinner"></div>
+      <div><strong>正在建立本地索引</strong><span>首次扫描较慢，之后只重读发生变化的会话。</span></div>
+    </section>
+
+    <div id="dashboard" class="hidden">
+      <section id="connectionBanner" class="connection-banner"></section>
+      <section class="cards" id="metricCards"></section>
+
+      <section class="grid today-grid">
+        <article class="panel">
+          <div class="panel-head">
+            <div><span class="kicker">TODAY VS YESTERDAY</span><h2>今天与昨天逐项对比</h2></div>
+            <span id="dayCompareNote" class="panel-note"></span>
+          </div>
+          <div class="day-headlines" id="dayHeadlines"></div>
+          <div class="day-compare-table" id="dayCompareTable"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><div><span class="kicker">HOURLY DETAIL</span><h2>今日 / 昨日小时流量</h2></div><span class="hour-legend"><i></i>今天 <i></i>昨天</span></div>
+          <div id="dayHourChart" class="day-hour-chart"></div>
+        </article>
+      </section>
+
+      <section class="grid trend-grid">
+        <article class="panel chart-panel">
+          <div class="panel-head">
+            <div><span class="kicker">TRAFFIC TREND</span><h2>Token 流量趋势</h2></div>
+            <div class="legend"><span class="dot input"></span>非缓存输入 <span class="dot cache"></span>缓存输入 <span class="dot output"></span>输出</div>
+          </div>
+          <div class="chart-wrap"><canvas id="trendChart"></canvas><div id="chartTooltip" class="tooltip hidden"></div></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><div><span class="kicker">MODEL SHARE</span><h2>模型流量占比</h2></div></div>
+          <div class="donut-layout">
+            <canvas id="modelChart"></canvas>
+            <div id="modelLegend" class="model-legend"></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="grid equal-grid">
+        <article class="panel">
+          <div class="panel-head"><div><span class="kicker">PEAKS</span><h2>流量巅峰</h2></div><span class="panel-note">按所选范围计算</span></div>
+          <div id="peakGrid" class="peak-grid"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><div><span class="kicker">DEVICES</span><h2>设备对比</h2></div><span class="panel-note">Linux + Windows</span></div>
+          <div id="deviceComparison" class="bar-ranking"></div>
+        </article>
+      </section>
+
+      <section class="panel daily-detail-panel">
+        <div class="panel-head">
+          <div><span class="kicker">DAILY DETAILS</span><h2>最近 14 天每日明细</h2></div>
+          <span class="panel-note">包含无用量日期</span>
+        </div>
+        <div class="table-wrap daily-table-wrap">
+          <table class="daily-table">
+            <thead><tr><th>日期</th><th>总流量</th><th>较前日</th><th>非缓存输入</th><th>缓存输入</th><th>模型输出</th><th>推理输出</th><th>会话</th><th>轮次</th><th>工具</th><th>任务耗时</th><th>设备</th></tr></thead>
+            <tbody id="dailyDetailRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="grid thirds-grid">
+        <article class="panel">
+          <div class="panel-head"><div><span class="kicker">PROJECTS</span><h2>项目流量排行</h2></div></div>
+          <div id="projectRanking" class="bar-ranking"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><div><span class="kicker">TIME PROFILE</span><h2>24 小时使用分布</h2></div></div>
+          <div id="hourChart" class="hour-chart"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><div><span class="kicker">TOOLS</span><h2>工具调用排行</h2></div></div>
+          <div id="toolRanking" class="bar-ranking"></div>
+        </article>
+      </section>
+
+      <section class="grid equal-grid">
+        <article class="panel">
+          <div class="panel-head"><div><span class="kicker">ACTIVITY</span><h2>跨设备活跃日历</h2></div><span id="activityNote" class="panel-note"></span></div>
+          <div class="activity" id="activityGrid"></div>
+          <div class="activity-scale"><span>少</span><i></i><i></i><i></i><i></i><i></i><span>多</span></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><div><span class="kicker">INSIGHTS</span><h2>效率与使用洞察</h2></div></div>
+          <div id="insights" class="insights"></div>
+        </article>
+      </section>
+
+      <section class="panel sessions-panel">
+        <div class="panel-head sessions-head">
+          <div><span class="kicker">SESSIONS</span><h2>跨设备会话明细</h2></div>
+          <input id="sessionSearch" type="search" placeholder="搜索设备、会话、模型或项目">
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>设备 / 会话</th><th>时间</th><th>项目</th><th>模型</th><th>非缓存输入</th><th>缓存</th><th>输出</th><th>任务耗时</th><th>总流量</th></tr></thead>
+            <tbody id="sessionRows"></tbody>
+          </table>
+        </div>
+        <div id="tableNote" class="table-note"></div>
+      </section>
+    </div>
+  </main>
+
+  <div id="settingsModal" class="modal hidden">
+    <div class="modal-backdrop" data-close-settings></div>
+    <section class="modal-card">
+      <header class="modal-head">
+        <div><span class="kicker">TAILSCALE SYNC</span><h2>设备与同步设置</h2></div>
+        <button class="close-button" data-close-settings>×</button>
+      </header>
+      <div class="setup-guide">
+        <strong>连接 Windows 的方法</strong>
+        <span>在 Windows 打开同一应用，复制它显示的 Tailscale 地址和访问令牌；再回到这里添加为远程设备。传输的是统计结果，不包含提示词正文。</span>
+      </div>
+      <div class="settings-section">
+        <h3>本机</h3>
+        <div class="form-grid">
+          <label><span>设备名称</span><input id="deviceNameInput"></label>
+          <label class="wide"><span>Codex 数据目录</span><div class="input-action"><input id="codexHomeInput"><button id="chooseHomeButton">选择</button></div></label>
+          <label class="switch-row"><input id="shareEnabledInput" type="checkbox"><span>允许通过 Tailscale 提供本机统计</span></label>
+          <label><span>同步端口</span><input id="sharePortInput" type="number" min="1024" max="65535"></label>
+        </div>
+        <div class="share-box">
+          <div><span>Tailscale 地址</span><strong id="shareAddressText">检测中…</strong></div>
+          <button data-copy="address">复制地址</button>
+          <div><span>本机访问令牌</span><strong id="shareTokenText" class="token-text"></strong></div>
+          <button data-copy="token">复制令牌</button>
+          <button id="regenerateTokenButton" class="danger-link">重新生成</button>
+        </div>
+      </div>
+      <div class="settings-section">
+        <div class="section-title"><h3>远程设备</h3><button id="addPeerButton">＋ 添加设备</button></div>
+        <div id="peerEditor" class="peer-editor"></div>
+      </div>
+      <footer class="modal-footer">
+        <span id="settingsMessage"></span>
+        <div><button class="secondary" data-close-settings>取消</button><button id="saveSettingsButton" class="primary-button">保存并连接</button></div>
+      </footer>
+    </section>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

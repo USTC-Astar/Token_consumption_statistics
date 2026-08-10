@@ -1,0 +1,66 @@
+{
+  "name": "codex-traffic-studio",
+  "version": "2.2.0",
+  "description": "跨 Windows、macOS 和 Linux 的本地 Codex 流量统计桌面应用",
+  "private": true,
+  "keywords": ["codex", "electron", "token-usage", "tailscale", "analytics"],
+  "main": "src/main.js",
+  "desktopName": "codex-traffic-studio.desktop",
+  "author": "zzs",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=10"
+  },
+  "scripts": {
+    "start": "electron .",
+    "check": "node --check src/main.js && node --check src/preload.js && node --check src/stats.js && node --check src/sync-server.js && node --check static/app.js",
+    "verify:release": "node scripts/verify-release-tag.js",
+    "dist:linux": "electron-builder --linux AppImage",
+    "dist:win": "electron-builder --win portable",
+    "dist:mac": "electron-builder --mac dmg zip",
+    "pack": "electron-builder --dir"
+  },
+  "devDependencies": {
+    "electron": "^43.3.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.zzs.codextrafficstudio",
+    "productName": "Codex 流量统计",
+    "asar": true,
+    "files": [
+      "src/**/*",
+      "static/**/*",
+      "build/icon.*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Utility",
+      "icon": "build/icon.png",
+      "syncDesktopName": true,
+      "artifactName": "Codex-Traffic-Studio-${version}-${arch}.${ext}"
+    },
+    "win": {
+      "target": ["portable"],
+      "icon": "build/icon.ico",
+      "artifactName": "Codex-Traffic-Studio-${version}-${arch}.${ext}"
+    },
+    "mac": {
+      "target": ["dmg", "zip"],
+      "icon": "build/icon.icns",
+      "category": "public.app-category.utilities",
+      "artifactName": "Codex-Traffic-Studio-${version}-${arch}.${ext}",
+      "identity": null,
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "extendInfo": {
+        "NSLocalNetworkUsageDescription": "用于通过 Tailscale 读取你授权的其他设备上的 Codex 聚合统计。"
+      }
+    }
+  }
+}
