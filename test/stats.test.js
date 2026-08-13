@@ -12,12 +12,15 @@ function writeSession(codexHome, name, rows) {
   fs.writeFileSync(path.join(directory, `${name}.jsonl`), `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`, "utf8");
 }
 
-function fixtureRows({ id, total, endedAt = "2026-08-12T10:00:03.000Z", meta = {} }) {
+function fixtureRows({ id, total, lastTotal = total, endedAt = "2026-08-12T10:00:03.000Z", meta = {} }) {
   return [
     { timestamp: "2026-08-12T10:00:00.000Z", type: "session_meta", payload: { id, session_id: id, timestamp: "2026-08-12T10:00:00.000Z", cwd: "/work/demo", source: "cli", model_provider: "openai", ...meta } },
     { timestamp: "2026-08-12T10:00:01.000Z", type: "turn_context", payload: { model: "gpt-test" } },
     { timestamp: "2026-08-12T10:00:01.000Z", type: "event_msg", payload: { type: "task_started" } },
-    { timestamp: "2026-08-12T10:00:02.000Z", type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: total - 10, cached_input_tokens: 20, output_tokens: 10, reasoning_output_tokens: 3, total_tokens: total } } } },
+    { timestamp: "2026-08-12T10:00:02.000Z", type: "event_msg", payload: { type: "token_count", info: {
+      total_token_usage: { input_tokens: total - 10, cached_input_tokens: 20, output_tokens: 10, reasoning_output_tokens: 3, total_tokens: total },
+      last_token_usage: { input_tokens: Math.max(0, lastTotal - 10), cached_input_tokens: 0, output_tokens: Math.min(10, lastTotal), reasoning_output_tokens: 3, total_tokens: lastTotal },
+    } } },
     { timestamp: endedAt, type: "event_msg", payload: { type: "task_complete" } },
   ];
 }
@@ -133,7 +136,7 @@ test("子代理会话使用代理昵称和任务路径命名，并保留父任�
     device: { id: "host", name: "测试电脑" },
   });
   const child = stats.sessions.find((session) => session.id === "child-session");
-  assert.equal(stats.schemaVersion, 6);
+  assert.equal(stats.schemaVersion, 7);
   assert.equal(child.title, "子代理 · Kant · active_slam_audit");
   assert.equal(child.threadSource, "subagent");
   assert.equal(child.parentThreadId, "parent-session");
@@ -142,15 +145,16 @@ test("子代理会话使用代理昵称和任务路径命名，并保留父任�
   assert.equal(child.agentTaskName, "active_slam_audit");
 });
 
-test("同一根任务存在主会话时，即使子代理快照更大也只保留主会话", async (context) => {
+test("同一根任务保留主会话和不同子代理，但子代理只计算继承基线后的真实增量", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-traffic-family-test-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const codexHome = path.join(root, "codex");
   writeSession(codexHome, "parent", fixtureRows({ id: "parent-session", total: 300, endedAt: "2026-08-12T10:10:00.000Z" }));
-  for (const [id, total, nickname] of [["child-a", 220, "Kant"], ["child-b", 350, "Einstein"]]) {
+  for (const [id, total, lastTotal, nickname] of [["child-a", 220, 20, "Kant"], ["child-b", 350, 30, "Einstein"]]) {
     writeSession(codexHome, id, fixtureRows({
       id,
       total,
+      lastTotal,
       endedAt: "2026-08-12T10:20:00.000Z",
       meta: {
         session_id: "parent-session",
@@ -169,21 +173,23 @@ test("同一根任务存在主会话时，即使子代理快照更大也只保�
     device: { id: "host", name: "测试电脑" },
   });
 
-  assert.equal(stats.schemaVersion, 6);
-  assert.equal(stats.sessions.length, 1);
-  assert.equal(stats.sessions[0].id, "parent-session");
-  assert.equal(stats.totals.total, 300);
-  assert.equal(stats.duplicateSessions, 2);
+  assert.equal(stats.schemaVersion, 7);
+  assert.equal(stats.sessions.length, 3);
+  assert.equal(stats.totals.total, 350);
+  assert.equal(stats.sessions.find((session) => session.id === "child-a").total, 20);
+  assert.equal(stats.sessions.find((session) => session.id === "child-b").total, 30);
+  assert.equal(stats.duplicateSessions, 0);
 });
 
-test("根会话日志缺失时，同组子代理保留 Token 最大的一份", async (context) => {
+test("根会话日志缺失时，不同子代理仍分别保留各自真实增量", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-traffic-family-fallback-test-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const codexHome = path.join(root, "codex");
-  for (const [id, total, endedAt] of [["child-old", 500, "2026-08-12T10:10:00.000Z"], ["child-new", 550, "2026-08-12T10:20:00.000Z"]]) {
+  for (const [id, total, lastTotal, endedAt] of [["child-old", 500, 40, "2026-08-12T10:10:00.000Z"], ["child-new", 550, 60, "2026-08-12T10:20:00.000Z"]]) {
     writeSession(codexHome, id, fixtureRows({
       id,
       total,
+      lastTotal,
       endedAt,
       meta: {
         session_id: "missing-parent",
@@ -202,10 +208,47 @@ test("根会话日志缺失时，同组子代理保留 Token 最大的一份", a
     device: { id: "host", name: "测试电脑" },
   });
 
+  assert.equal(stats.sessions.length, 2);
+  assert.equal(stats.totals.total, 100);
+  assert.equal(stats.sessions.find((session) => session.id === "child-old").total, 40);
+  assert.equal(stats.sessions.find((session) => session.id === "child-new").total, 60);
+  assert.equal(stats.duplicateSessions, 0);
+});
+
+test("子代理首条只算 last_token_usage，后续继续按累计值差分", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-traffic-agent-baseline-test-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const codexHome = path.join(root, "codex");
+  const rows = fixtureRows({
+    id: "child-session",
+    total: 1000,
+    lastTotal: 20,
+    meta: {
+      session_id: "parent-session",
+      thread_source: "subagent",
+      parent_thread_id: "parent-session",
+      source: { subagent: { thread_spawn: {} } },
+    },
+  });
+  rows.splice(4, 0, {
+    timestamp: "2026-08-12T10:00:02.500Z",
+    type: "event_msg",
+    payload: { type: "token_count", info: {
+      total_token_usage: { input_tokens: 1030, cached_input_tokens: 20, output_tokens: 20, reasoning_output_tokens: 5, total_tokens: 1050 },
+      last_token_usage: { input_tokens: 30, cached_input_tokens: 0, output_tokens: 20, reasoning_output_tokens: 2, total_tokens: 50 },
+    } },
+  });
+  writeSession(codexHome, "child-session", rows);
+
+  const stats = await scanCodexData({
+    sources: [{ id: "local", name: "本机", path: codexHome }],
+    cachePath: path.join(root, "cache.json"),
+    device: { id: "host", name: "测试电脑" },
+  });
+
   assert.equal(stats.sessions.length, 1);
-  assert.equal(stats.sessions[0].id, "child-new");
-  assert.equal(stats.totals.total, 550);
-  assert.equal(stats.duplicateSessions, 1);
+  assert.equal(stats.sessions[0].total, 70);
+  assert.equal(stats.totals.total, 70);
 });
 
 test("子代理在 turn_context 前产生的 Token 会归入 thread_settings_applied 声明的模型", async (context) => {
@@ -240,7 +283,7 @@ test("子代理在 turn_context 前产生的 Token 会归入 thread_settings_app
   assert.equal(stats.sessions[0].model, "gpt-5.6-sol");
 });
 
-test("版本 4 远程端仍可按会话 ID 去重，但明确提示缺少根任务去重信息", async (context) => {
+test("版本 4 远程端可按会话 ID 去重，但提示缺少新版子代理基线扣除", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-traffic-v4-test-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const codexHome = path.join(root, "remote");

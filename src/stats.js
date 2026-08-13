@@ -4,10 +4,10 @@ const readline = require("readline");
 const os = require("os");
 
 const USAGE_KEYS = ["input", "cached", "output", "reasoning", "total"];
-const CACHE_VERSION = 7;
-const SCHEMA_VERSION = 6;
+const CACHE_VERSION = 8;
+const SCHEMA_VERSION = 7;
 const EXACT_BREAKDOWN_SCHEMA_VERSION = 4;
-const FAMILY_DEDUPE_SCHEMA_VERSION = 5;
+const SUBAGENT_BASELINE_SCHEMA_VERSION = 7;
 
 function emptyUsage() {
   return { input: 0, cached: 0, output: 0, reasoning: 0, total: 0 };
@@ -76,13 +76,21 @@ function cloneUsageTimeline(timeline, length) {
 }
 
 function tokenValues(info) {
-  const usage = info?.total_token_usage || {};
+  return usageValues(info?.total_token_usage);
+}
+
+function lastTokenValues(info) {
+  return usageValues(info?.last_token_usage);
+}
+
+function usageValues(usage) {
+  const value = usage || {};
   return {
-    input: Number(usage.input_tokens || 0),
-    cached: Number(usage.cached_input_tokens || 0),
-    output: Number(usage.output_tokens || 0),
-    reasoning: Number(usage.reasoning_output_tokens || 0),
-    total: Number(usage.total_tokens || 0),
+    input: Number(value.input_tokens || 0),
+    cached: Number(value.cached_input_tokens || 0),
+    output: Number(value.output_tokens || 0),
+    reasoning: Number(value.reasoning_output_tokens || 0),
+    total: Number(value.total_tokens || 0),
   };
 }
 
@@ -216,6 +224,7 @@ async function parseSessionFile(filePath) {
   let turns = 0;
   let tools = 0;
   let userMessages = 0;
+  let hasPreviousUsage = false;
   let previousUsage = emptyUsage();
   const accumulatedUsage = emptyUsage();
   const daily = {};
@@ -300,7 +309,12 @@ async function parseSessionFile(filePath) {
       }
     } else if (payloadType === "token_count") {
       const current = tokenValues(payload.info);
-      const delta = usageDelta(current, previousUsage);
+      // 子代理启动时会继承父任务当时的线程累计值。第一条 total_token_usage 的绝大部分
+      // 不是子代理自己消耗的流量，只能把本次请求的 last_token_usage 作为首次增量。
+      // 后续记录继续对累计值做相邻差分，这样既保留真实子代理用量，又不会重复父任务基线。
+      const delta = subagentInfo({ threadSource, source }).isSubagent && !hasPreviousUsage
+        ? lastTokenValues(payload.info)
+        : usageDelta(current, previousUsage);
       addUsage(accumulatedUsage, delta);
       models[currentModel] = (models[currentModel] || 0) + delta.total;
       if (parts) {
@@ -312,6 +326,7 @@ async function parseSessionFile(filePath) {
         addUsage(weekdays[parts.weekday], delta);
       }
       previousUsage = current;
+      hasPreviousUsage = true;
     }
   }
 
@@ -459,27 +474,6 @@ function isRecordNewer(candidate, current) {
   return false;
 }
 
-function sessionFamilyId(record) {
-  const session = record.session || {};
-  const agent = subagentInfo(session);
-  // 新版 Codex 的主会话和子代理会写入同一份线程累计 Token。
-  // 因此 rootSessionId 相同的记录不是可相加的独立用量，而是同一累计值在不同线程中的镜像。
-  return String(agent.rootSessionId || (agent.isSubagent ? agent.parentThreadId : "") || session.id || "");
-}
-
-function isPrimaryFamilyRecord(record, familyId) {
-  const session = record.session || {};
-  return !subagentInfo(session).isSubagent && String(session.id || "") === familyId;
-}
-
-function isFamilyRecordBetter(candidate, current, familyId) {
-  const candidatePrimary = isPrimaryFamilyRecord(candidate, familyId);
-  const currentPrimary = isPrimaryFamilyRecord(current, familyId);
-  // 主会话已经包含整棵子代理树的线程累计 Token；存在主会话时不能再用子代理镜像替代它。
-  if (candidatePrimary !== currentPrimary) return candidatePrimary;
-  return isRecordNewer(candidate, current);
-}
-
 function dedupeRecords(records) {
   const uniqueSessions = new Map();
   for (const record of records) {
@@ -489,17 +483,9 @@ function dedupeRecords(records) {
     if (!current || isRecordNewer(record, current)) uniqueSessions.set(id, record);
   }
 
-  const uniqueFamilies = new Map();
-  for (const record of uniqueSessions.values()) {
-    const familyId = sessionFamilyId(record);
-    if (!familyId) continue;
-    const current = uniqueFamilies.get(familyId);
-    // 同一根任务优先保留主会话；主会话缺失时，才在子代理中选择最完整的一份。
-    if (!current || isFamilyRecordBetter(record, current, familyId)) uniqueFamilies.set(familyId, record);
-  }
   return {
-    records: [...uniqueFamilies.values()],
-    duplicateSessions: Math.max(0, records.length - uniqueFamilies.size),
+    records: [...uniqueSessions.values()],
+    duplicateSessions: Math.max(0, records.length - uniqueSessions.size),
   };
 }
 
@@ -615,14 +601,14 @@ function mergeLegacyStats(target, legacy) {
 function combineStatsData(statsRows, metadata = {}) {
   const exactRecords = [];
   const legacyRows = [];
-  let familyDedupeLimited = false;
+  let subagentBaselineLimited = false;
   for (const stats of statsRows.filter(Boolean)) {
     const sessions = stats.sessions || [];
-    // 版本 4 已有会话级日统计，可以按会话 ID 去重；版本 5 才包含根会话关系，能继续消除子代理累计镜像。
+    // 版本 4 已具备会话级日统计，可以在汇总端继续按会话 ID 精确去重。
     const exact = Number(stats.schemaVersion || 0) >= EXACT_BREAKDOWN_SCHEMA_VERSION && sessions.every((session) => session?.breakdown?.daily);
     if (exact) {
       exactRecords.push(...sessions.map(recordFromSession).filter(Boolean));
-      if (Number(stats.schemaVersion || 0) < FAMILY_DEDUPE_SCHEMA_VERSION) familyDedupeLimited = true;
+      if (Number(stats.schemaVersion || 0) < SUBAGENT_BASELINE_SCHEMA_VERSION) subagentBaselineLimited = true;
     } else {
       // 旧版远程端没有会话级日统计，无法安全地从总数中减掉重复会话，只能兼容性相加。
       legacyRows.push(stats);
@@ -633,7 +619,7 @@ function combineStatsData(statsRows, metadata = {}) {
     filesScanned: statsRows.reduce((sum, stats) => sum + Number(stats?.filesScanned || 0), 0),
     reparsedFiles: statsRows.reduce((sum, stats) => sum + Number(stats?.reparsedFiles || 0), 0),
     duplicateSessions: statsRows.reduce((sum, stats) => sum + Number(stats?.duplicateSessions || 0), 0),
-    dedupeMode: legacyRows.length || familyDedupeLimited ? "partial" : "exact",
+    dedupeMode: legacyRows.length || subagentBaselineLimited ? "partial" : "exact",
   });
   for (const legacy of legacyRows) mergeLegacyStats(result, legacy);
   return result;
