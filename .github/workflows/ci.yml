@@ -33,5 +33,8 @@ jobs:
       - name: Check JavaScript syntax
         run: npm run check
 
+      - name: Run automated tests
+        run: npm test
+
       - name: Audit high-severity vulnerabilities
         run: npm audit --audit-level=high

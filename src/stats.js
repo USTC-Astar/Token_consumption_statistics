@@ -4,6 +4,9 @@ const readline = require("readline");
 const os = require("os");
 
 const USAGE_KEYS = ["input", "cached", "output", "reasoning", "total"];
+const CACHE_VERSION = 6;
+const SCHEMA_VERSION = 5;
+const EXACT_BREAKDOWN_SCHEMA_VERSION = 4;
 
 function emptyUsage() {
   return { input: 0, cached: 0, output: 0, reasoning: 0, total: 0 };
@@ -31,19 +34,44 @@ function addNumberMap(target, source) {
 }
 
 function addUsage(target, usage) {
-  for (const key of USAGE_KEYS) target[key] += Number(usage[key] || 0);
+  for (const key of USAGE_KEYS) target[key] += Number(usage?.[key] || 0);
 }
 
 function addBucket(target, source) {
   addUsage(target, source);
   for (const key of ["turns", "tools", "sessions", "activeSeconds"]) {
-    target[key] += Number(source[key] || 0);
+    target[key] += Number(source?.[key] || 0);
   }
-  addNumberMap(target.models, source.models);
-  addNumberMap(target.projects, source.projects);
-  addNumberMap(target.devices, source.devices);
-  addNumberMap(target.hours, source.hours);
-  addNumberMap(target.toolNames, source.toolNames);
+  addNumberMap(target.models, source?.models);
+  addNumberMap(target.projects, source?.projects);
+  addNumberMap(target.devices, source?.devices);
+  addNumberMap(target.hours, source?.hours);
+  addNumberMap(target.toolNames, source?.toolNames);
+}
+
+function cloneBucket(bucket) {
+  return {
+    ...emptyBucket(),
+    ...Object.fromEntries(USAGE_KEYS.map((key) => [key, Number(bucket?.[key] || 0)])),
+    turns: Number(bucket?.turns || 0),
+    tools: Number(bucket?.tools || 0),
+    sessions: Number(bucket?.sessions || 0),
+    activeSeconds: Number(bucket?.activeSeconds || 0),
+    models: { ...(bucket?.models || {}) },
+    projects: { ...(bucket?.projects || {}) },
+    devices: { ...(bucket?.devices || {}) },
+    hours: { ...(bucket?.hours || {}) },
+    toolNames: { ...(bucket?.toolNames || {}) },
+  };
+}
+
+function cloneUsageTimeline(timeline, length) {
+  return Array.from({ length }, (_, index) => ({
+    ...emptyUsage(),
+    ...(timeline?.[index] || {}),
+    turns: Number(timeline?.[index]?.turns || 0),
+    tools: Number(timeline?.[index]?.tools || 0),
+  }));
 }
 
 function tokenValues(info) {
@@ -63,6 +91,28 @@ function usageDelta(current, previous) {
   return Object.fromEntries(USAGE_KEYS.map((key) => [key, Math.max(0, current[key] - previous[key])]));
 }
 
+function declaredModel(rowType, payload) {
+  if (rowType === "turn_context") return String(payload?.model || "").trim();
+  if (payload?.type !== "thread_settings_applied") return "";
+  const settings = payload.thread_settings || {};
+  return String(settings.model || settings.collaboration_mode?.settings?.model || "").trim();
+}
+
+function moveUnknownUsageToModel(model, models, daily) {
+  if (!model || model === "未知模型") return;
+  const unknownTotal = Number(models["未知模型"] || 0);
+  if (unknownTotal > 0) {
+    models[model] = (models[model] || 0) + unknownTotal;
+    delete models["未知模型"];
+  }
+  for (const bucket of Object.values(daily)) {
+    const unknownDaily = Number(bucket.models?.["未知模型"] || 0);
+    if (unknownDaily <= 0) continue;
+    bucket.models[model] = (bucket.models[model] || 0) + unknownDaily;
+    delete bucket.models["未知模型"];
+  }
+}
+
 function localParts(timestamp) {
   const value = new Date(timestamp);
   if (!timestamp || Number.isNaN(value.getTime())) return null;
@@ -80,6 +130,38 @@ function projectName(cwd) {
   return normalized.includes("\\") ? path.win32.basename(normalized) : path.basename(normalized);
 }
 
+function taskNameFromAgentPath(agentPath) {
+  return String(agentPath || "").split("/").filter(Boolean).at(-1) || "";
+}
+
+function subagentInfo(session) {
+  const spawn = session?.source && typeof session.source === "object"
+    ? session.source?.subagent?.thread_spawn
+    : null;
+  const agentPath = String(session?.agentPath || spawn?.agent_path || "");
+  const isSubagent = session?.threadSource === "subagent" || Boolean(spawn);
+  return {
+    isSubagent,
+    threadSource: isSubagent ? "subagent" : String(session?.threadSource || "user"),
+    parentThreadId: String(session?.parentThreadId || spawn?.parent_thread_id || ""),
+    rootSessionId: String(session?.rootSessionId || ""),
+    agentNickname: String(session?.agentNickname || spawn?.agent_nickname || ""),
+    agentPath,
+    agentTaskName: String(session?.agentTaskName || taskNameFromAgentPath(agentPath)),
+    agentRole: String(session?.agentRole || spawn?.agent_role || ""),
+    agentDepth: Number(session?.agentDepth ?? spawn?.depth ?? (isSubagent ? 1 : 0)),
+  };
+}
+
+function sessionTitle(session, indexedTitle) {
+  const agent = subagentInfo(session);
+  if (agent.isSubagent) {
+    const parts = ["子代理", agent.agentNickname, agent.agentTaskName].filter(Boolean);
+    if (parts.length > 1) return parts.join(" · ");
+  }
+  return indexedTitle || "未命名会话";
+}
+
 async function readTitles(codexHome) {
   const titles = {};
   const indexPath = path.join(codexHome, "session_index.jsonl");
@@ -91,7 +173,7 @@ async function readTitles(codexHome) {
       const row = JSON.parse(line);
       if (row.id) titles[row.id] = row.thread_name || "未命名会话";
     } catch {
-      // 单行损坏不应导致整次统计失败；Codex 仍可能正在写入当前日志。
+      // Codex 可能正在写入索引；单行暂时不完整时跳过，不中断其他日志统计。
     }
   }
   return titles;
@@ -112,13 +194,20 @@ function collectSessionFiles(codexHome) {
   return files.sort();
 }
 
-async function parseSessionFile(filePath, device) {
+async function parseSessionFile(filePath) {
   let sessionId = path.basename(filePath, ".jsonl");
   let startedAt = null;
   let endedAt = null;
   let cwd = "";
   let source = "";
   let provider = "";
+  let threadSource = "user";
+  let parentThreadId = "";
+  let rootSessionId = "";
+  let agentNickname = "";
+  let agentPath = "";
+  let agentRole = "";
+  let agentDepth = 0;
   let currentModel = "未知模型";
   let currentTaskStarted = null;
   let activeSeconds = 0;
@@ -155,9 +244,26 @@ async function parseSessionFile(filePath, device) {
       cwd = payload.cwd || cwd;
       source = payload.source || source;
       provider = payload.model_provider || provider;
-    } else if (row.type === "turn_context") {
-      currentModel = payload.model || currentModel;
-      modelTurns[currentModel] = (modelTurns[currentModel] || 0) + 1;
+      const spawn = payload.source && typeof payload.source === "object"
+        ? payload.source?.subagent?.thread_spawn
+        : null;
+      threadSource = payload.thread_source || (spawn ? "subagent" : threadSource);
+      parentThreadId = payload.parent_thread_id || spawn?.parent_thread_id || parentThreadId;
+      agentNickname = payload.agent_nickname || spawn?.agent_nickname || agentNickname;
+      agentPath = payload.agent_path || spawn?.agent_path || agentPath;
+      agentRole = payload.agent_role || spawn?.agent_role || agentRole;
+      agentDepth = Number(payload.agent_depth ?? spawn?.depth ?? agentDepth);
+      // 子代理日志中的 session_id 指向根任务，而 id 是当前子代理自己的会话 ID。
+      if (threadSource === "subagent") rootSessionId = payload.root_thread_id || payload.session_id || rootSessionId;
+    }
+
+    const model = declaredModel(row.type, payload);
+    if (model) {
+      // 新版 Codex 的子代理在首个 turn_context 之前就会写入累计 Token，
+      // 但 thread_settings_applied 已经给出了实际模型；首次识别时要把这些流量回填过去。
+      if (currentModel === "未知模型") moveUnknownUsageToModel(model, models, daily);
+      currentModel = model;
+      modelTurns[model] = (modelTurns[model] || 0) + 1;
     }
 
     if (payloadType === "task_started") {
@@ -214,7 +320,6 @@ async function parseSessionFile(filePath, device) {
   if (startParts) daily[startParts.date].sessions += 1;
   for (const bucket of Object.values(daily)) {
     bucket.projects[project] = (bucket.projects[project] || 0) + bucket.total;
-    bucket.devices[device.id] = (bucket.devices[device.id] || 0) + bucket.total;
   }
   if (currentTaskStarted && endParts?.epoch >= currentTaskStarted) {
     const duration = Math.round((endParts.epoch - currentTaskStarted) / 1000);
@@ -238,14 +343,20 @@ async function parseSessionFile(filePath, device) {
       project,
       source,
       provider,
+      threadSource,
+      parentThreadId,
+      rootSessionId,
+      agentNickname,
+      agentPath,
+      agentTaskName: taskNameFromAgentPath(agentPath),
+      agentRole,
+      agentDepth,
       model: dominantModel,
       turns,
       tools,
       userMessages,
       activeSeconds,
       wallSeconds,
-      deviceId: device.id,
-      deviceName: device.name,
       ...accumulatedUsage,
     },
     daily,
@@ -260,7 +371,7 @@ function loadCache(cachePath) {
   try {
     return JSON.parse(fs.readFileSync(cachePath, "utf8"));
   } catch {
-    return { version: 3, files: {} };
+    return { version: CACHE_VERSION, files: {} };
   }
 }
 
@@ -271,48 +382,121 @@ function saveCache(cachePath, cache) {
   fs.renameSync(temporary, cachePath);
 }
 
+function normalizeSources({ sources, codexHome }) {
+  const input = Array.isArray(sources) && sources.length
+    ? sources
+    : [{ id: "default", name: "本机 Codex", path: codexHome || path.join(os.homedir(), ".codex"), enabled: true }];
+  const seen = new Set();
+  return input.filter((source) => source?.enabled !== false).map((source, index) => {
+    const rawPath = String(source.path || source.codexHome || "").trim();
+    if (!rawPath) return null;
+    const sourcePath = path.resolve(rawPath);
+    const pathKey = process.platform === "win32" ? sourcePath.toLowerCase() : sourcePath;
+    if (!sourcePath || seen.has(pathKey)) return null;
+    seen.add(pathKey);
+    return {
+      id: String(source.id || `source-${index + 1}`),
+      name: String(source.name || `数据源 ${index + 1}`),
+      path: sourcePath,
+      enabled: true,
+    };
+  }).filter(Boolean);
+}
+
+function decorateResult(raw, source, device, title) {
+  const originId = `${device.id}:${source.id}`;
+  const originName = `${device.name} · ${source.name}`;
+  const daily = Object.fromEntries(Object.entries(raw.daily || {}).map(([date, value]) => {
+    const bucket = cloneBucket(value);
+    // 这个映射只用于判断一天内有多少来源活跃；零 Token 会话也应被视为活跃。
+    const activity = Math.max(bucket.total, bucket.sessions, bucket.turns, bucket.tools);
+    if (activity > 0) bucket.devices[originId] = activity;
+    return [date, bucket];
+  }));
+  return {
+    session: {
+      ...raw.session,
+      ...subagentInfo(raw.session),
+      title: sessionTitle(raw.session, title),
+      deviceId: device.id,
+      deviceName: device.name,
+      sourceId: source.id,
+      sourceName: source.name,
+      sourcePath: source.path,
+      originId,
+      originName,
+    },
+    daily,
+    models: { ...(raw.models || {}) },
+    hours: cloneUsageTimeline(raw.hours, 24),
+    weekdays: cloneUsageTimeline(raw.weekdays, 7),
+    toolNames: { ...(raw.toolNames || {}) },
+  };
+}
+
+function recordRank(record) {
+  const ended = Date.parse(record.session?.endedAt || "") || 0;
+  const total = Number(record.session?.total || 0);
+  const activity = Number(record.session?.turns || 0) + Number(record.session?.tools || 0);
+  // 相同会话可能同时出现在活动目录、归档目录或另一套系统中。Token 总量和活动记录更能代表“完整副本”，结束时间仅作为最终平局条件。
+  return [total, activity, ended];
+}
+
+function isRecordNewer(candidate, current) {
+  const left = recordRank(candidate);
+  const right = recordRank(current);
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return left[index] > right[index];
+  }
+  return false;
+}
+
+function dedupeRecords(records) {
+  const unique = new Map();
+  for (const record of records) {
+    const id = record.session?.id;
+    if (!id) continue;
+    const current = unique.get(id);
+    if (!current || isRecordNewer(record, current)) unique.set(id, record);
+  }
+  return { records: [...unique.values()], duplicateSessions: Math.max(0, records.length - unique.size) };
+}
+
 function mergeHourOrWeek(target, source) {
   source.forEach((bucket, index) => {
     addUsage(target[index], bucket);
-    target[index].turns += bucket.turns || 0;
-    target[index].tools += bucket.tools || 0;
+    target[index].turns += Number(bucket?.turns || 0);
+    target[index].tools += Number(bucket?.tools || 0);
   });
 }
 
-async function scanCodexData({ codexHome, cachePath, device }) {
-  const started = Date.now();
-  const titles = await readTitles(codexHome);
-  const files = collectSessionFiles(codexHome);
-  const cache = loadCache(cachePath);
-  if (cache.version !== 3) cache.files = {};
-  cache.version = 3;
-  const nextFiles = {};
-  const parsed = [];
-  let reparsedFiles = 0;
+function sessionWithBreakdown(record) {
+  return {
+    ...record.session,
+    breakdown: {
+      daily: Object.fromEntries(Object.entries(record.daily || {}).map(([date, bucket]) => [date, cloneBucket(bucket)])),
+      models: { ...(record.models || {}) },
+      hours: cloneUsageTimeline(record.hours, 24),
+      weekdays: cloneUsageTimeline(record.weekdays, 7),
+      toolNames: { ...(record.toolNames || {}) },
+    },
+  };
+}
 
-  for (const filePath of files) {
-    const stat = fs.statSync(filePath);
-    const signature = `${stat.size}:${stat.mtimeMs}`;
-    let result = cache.files[filePath]?.signature === signature ? cache.files[filePath].result : null;
-    if (!result) {
-      result = await parseSessionFile(filePath, device);
-      reparsedFiles += 1;
-    }
-    nextFiles[filePath] = { signature, result };
-    parsed.push(result);
-  }
-  cache.files = nextFiles;
-  saveCache(cachePath, cache);
+function recordFromSession(session) {
+  if (!session?.breakdown?.daily) return null;
+  return {
+    session: { ...session, breakdown: undefined },
+    daily: Object.fromEntries(Object.entries(session.breakdown.daily).map(([date, bucket]) => [date, cloneBucket(bucket)])),
+    models: { ...(session.breakdown.models || {}) },
+    hours: cloneUsageTimeline(session.breakdown.hours, 24),
+    weekdays: cloneUsageTimeline(session.breakdown.weekdays, 7),
+    toolNames: { ...(session.breakdown.toolNames || {}) },
+  };
+}
 
-  // 会话被归档时可能短暂同时出现在两个目录，按 session id 去重可以避免重复流量。
-  const unique = new Map();
-  for (const result of parsed) {
-    const current = unique.get(result.session.id);
-    if (!current || String(result.session.endedAt || "") > String(current.session.endedAt || "")) {
-      unique.set(result.session.id, result);
-    }
-  }
-
+function summarizeRecords(records, metadata = {}) {
+  const deduped = dedupeRecords(records);
   const daily = {};
   const models = {};
   const projects = {};
@@ -321,18 +505,17 @@ async function scanCodexData({ codexHome, cachePath, device }) {
   const weekdays = Array.from({ length: 7 }, () => ({ ...emptyUsage(), turns: 0, tools: 0 }));
   const sessions = [];
 
-  for (const result of unique.values()) {
-    result.session.title = titles[result.session.id] || "未命名会话";
-    sessions.push(result.session);
-    for (const [date, bucket] of Object.entries(result.daily)) {
+  for (const record of deduped.records) {
+    sessions.push(sessionWithBreakdown(record));
+    for (const [date, bucket] of Object.entries(record.daily || {})) {
       daily[date] ||= emptyBucket();
       addBucket(daily[date], bucket);
     }
-    addNumberMap(models, result.models);
-    projects[result.session.project] = (projects[result.session.project] || 0) + result.session.total;
-    addNumberMap(tools, result.toolNames);
-    mergeHourOrWeek(hours, result.hours);
-    mergeHourOrWeek(weekdays, result.weekdays);
+    addNumberMap(models, record.models);
+    projects[record.session.project] = (projects[record.session.project] || 0) + Number(record.session.total || 0);
+    addNumberMap(tools, record.toolNames);
+    mergeHourOrWeek(hours, record.hours || []);
+    mergeHourOrWeek(weekdays, record.weekdays || []);
   }
 
   sessions.sort((a, b) => String(b.endedAt || "").localeCompare(String(a.endedAt || "")));
@@ -343,13 +526,16 @@ async function scanCodexData({ codexHome, cachePath, device }) {
   }, emptyBucket());
 
   return {
-    schemaVersion: 3,
+    schemaVersion: SCHEMA_VERSION,
     generatedAt: new Date().toISOString(),
-    scanSeconds: Number(((Date.now() - started) / 1000).toFixed(2)),
-    filesScanned: files.length,
-    reparsedFiles,
-    codexHome,
-    device: { ...device, platform: process.platform, hostname: os.hostname() },
+    scanSeconds: Number(metadata.scanSeconds || 0),
+    filesScanned: Number(metadata.filesScanned || 0),
+    reparsedFiles: Number(metadata.reparsedFiles || 0),
+    duplicateSessions: deduped.duplicateSessions + Number(metadata.duplicateSessions || 0),
+    dedupeMode: metadata.dedupeMode || "exact",
+    codexHome: metadata.codexHome || metadata.source?.path || "",
+    device: metadata.device || null,
+    source: metadata.source || null,
     totals,
     daily: dailyRows,
     models,
@@ -361,4 +547,118 @@ async function scanCodexData({ codexHome, cachePath, device }) {
   };
 }
 
-module.exports = { scanCodexData, emptyBucket, addBucket, addNumberMap };
+function mergeLegacyStats(target, legacy) {
+  const rows = Object.fromEntries(target.daily.map((row) => [row.date, cloneBucket(row)]));
+  for (const row of legacy.daily || []) {
+    rows[row.date] ||= emptyBucket();
+    addBucket(rows[row.date], row);
+  }
+  target.daily = Object.entries(rows).sort(([a], [b]) => a.localeCompare(b)).map(([date, bucket]) => ({ date, ...bucket }));
+  target.totals = target.daily.reduce((sum, row) => { addBucket(sum, row); return sum; }, emptyBucket());
+  addNumberMap(target.models, legacy.models);
+  addNumberMap(target.projects, legacy.projects);
+  addNumberMap(target.tools, legacy.tools);
+  mergeHourOrWeek(target.hours, legacy.hours || []);
+  mergeHourOrWeek(target.weekdays, legacy.weekdays || []);
+  const sessions = new Map(target.sessions.map((session) => [session.id, session]));
+  for (const session of legacy.sessions || []) {
+    const current = sessions.get(session.id);
+    if (!current || String(session.endedAt || "") > String(current.endedAt || "")) sessions.set(session.id, session);
+  }
+  target.sessions = [...sessions.values()].sort((a, b) => String(b.endedAt || "").localeCompare(String(a.endedAt || "")));
+  target.filesScanned += Number(legacy.filesScanned || 0);
+  target.reparsedFiles += Number(legacy.reparsedFiles || 0);
+  target.duplicateSessions += Number(legacy.duplicateSessions || 0);
+}
+
+function combineStatsData(statsRows, metadata = {}) {
+  const exactRecords = [];
+  const legacyRows = [];
+  for (const stats of statsRows.filter(Boolean)) {
+    const sessions = stats.sessions || [];
+    // 版本 5 只增加子代理元数据；版本 4 已经具备精确去重所需的会话级日统计。
+    const exact = Number(stats.schemaVersion || 0) >= EXACT_BREAKDOWN_SCHEMA_VERSION && sessions.every((session) => session?.breakdown?.daily);
+    if (exact) {
+      exactRecords.push(...sessions.map(recordFromSession).filter(Boolean));
+    } else {
+      // 旧版远程端没有会话级日统计，无法安全地从总数中减掉重复会话，只能兼容性相加。
+      legacyRows.push(stats);
+    }
+  }
+  const result = summarizeRecords(exactRecords, {
+    ...metadata,
+    filesScanned: statsRows.reduce((sum, stats) => sum + Number(stats?.filesScanned || 0), 0),
+    reparsedFiles: statsRows.reduce((sum, stats) => sum + Number(stats?.reparsedFiles || 0), 0),
+    duplicateSessions: statsRows.reduce((sum, stats) => sum + Number(stats?.duplicateSessions || 0), 0),
+    dedupeMode: legacyRows.length ? "partial" : "exact",
+  });
+  for (const legacy of legacyRows) mergeLegacyStats(result, legacy);
+  return result;
+}
+
+async function scanCodexData({ sources, codexHome, cachePath, device }) {
+  const started = Date.now();
+  const normalizedSources = normalizeSources({ sources, codexHome });
+  const cache = loadCache(cachePath);
+  if (cache.version !== CACHE_VERSION) cache.files = {};
+  cache.version = CACHE_VERSION;
+  const nextFiles = {};
+  const allRecords = [];
+  const sourceRows = [];
+  let reparsedFiles = 0;
+  let filesScanned = 0;
+
+  for (const source of normalizedSources) {
+    const available = fs.existsSync(source.path) && fs.statSync(source.path).isDirectory();
+    const titles = available ? await readTitles(source.path) : {};
+    const files = available ? collectSessionFiles(source.path) : [];
+    const sourceRecords = [];
+    let sourceReparsedFiles = 0;
+
+    for (const filePath of files) {
+      const stat = fs.statSync(filePath);
+      const signature = `${stat.size}:${stat.mtimeMs}`;
+      let raw = cache.files[filePath]?.signature === signature ? cache.files[filePath].result : null;
+      if (!raw) {
+        raw = await parseSessionFile(filePath);
+        reparsedFiles += 1;
+        sourceReparsedFiles += 1;
+      }
+      nextFiles[filePath] = { signature, result: raw };
+      sourceRecords.push(decorateResult(raw, source, device, titles[raw.session.id]));
+    }
+
+    filesScanned += files.length;
+    allRecords.push(...sourceRecords);
+    const sourceData = summarizeRecords(sourceRecords, {
+      device: { ...device, platform: process.platform, hostname: os.hostname() },
+      source,
+      codexHome: source.path,
+      filesScanned: files.length,
+      reparsedFiles: sourceReparsedFiles,
+    });
+    sourceRows.push({ ...source, available, data: sourceData });
+  }
+
+  cache.files = nextFiles;
+  saveCache(cachePath, cache);
+
+  const combined = summarizeRecords(allRecords, {
+    device: { ...device, platform: process.platform, hostname: os.hostname() },
+    codexHome: normalizedSources[0]?.path || "",
+    filesScanned,
+    reparsedFiles,
+    scanSeconds: (Date.now() - started) / 1000,
+  });
+  combined.sources = sourceRows;
+  return combined;
+}
+
+module.exports = {
+  scanCodexData,
+  combineStatsData,
+  summarizeRecords,
+  emptyBucket,
+  addBucket,
+  addNumberMap,
+};

@@ -1,6 +1,6 @@
 const desktop = window.codexDesktop;
 if ("scrollRestoration" in history) history.scrollRestoration = "manual";
-const state = { snapshot: null, config: null, settingsDraft: null, period: "30", device: "all", query: "", initialized: false };
+const state = { snapshot: null, config: null, settingsDraft: null, update: null, period: "30", device: "all", query: "", initialized: false, expandedSessionGroups: new Set() };
 const colors = ["#1f9d68", "#5b8def", "#ff9e57", "#9b72cf", "#c7e65b", "#36b6c8", "#e86f8e"];
 const usageKeys = ["input", "cached", "output", "reasoning", "total"];
 const fmt = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 });
@@ -12,6 +12,48 @@ const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (char) => 
 const localDate = (value) => value ? new Date(value).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "—";
 const dateKey = (value) => `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
 const offsetDateKey = (offset = 0) => { const value = new Date(); value.setHours(12, 0, 0, 0); value.setDate(value.getDate() + offset); return dateKey(value); };
+
+function updateActionLabel(status) {
+  if (!status) return "检查更新";
+  if (status.phase === "checking") return "检查中…";
+  if (status.phase === "available") return status.canAutoInstall ? "发现新版本" : "新版可下载";
+  if (status.phase === "downloading") return `下载 ${Math.round(status.percent || 0)}%`;
+  if (status.phase === "downloaded") return "重启安装";
+  if (status.phase === "up-to-date") return "已是最新版";
+  if (status.phase === "error") return "更新状态";
+  return "检查更新";
+}
+
+function renderUpdateStatus(status = state.update) {
+  if (!status) return;
+  state.update = status;
+  const topButton = document.querySelector("#updateButton");
+  document.querySelector("#updateButtonText").textContent = updateActionLabel(status);
+  topButton.dataset.phase = status.phase;
+  topButton.disabled = status.phase === "checking";
+  const version = document.querySelector("#updateVersionText");
+  const message = document.querySelector("#updateStatusText");
+  if (!version || !message) return;
+  version.textContent = `当前 ${status.currentVersion}${status.availableVersion ? ` · 最新 ${status.availableVersion}` : ""}`;
+  message.textContent = status.message || "尚未检查更新";
+  const progress = document.querySelector("#updateProgress");
+  progress.classList.toggle("hidden", status.phase !== "downloading" && status.phase !== "downloaded");
+  document.querySelector("#updateProgressBar").style.width = `${status.phase === "downloaded" ? 100 : status.percent || 0}%`;
+  const check = document.querySelector("#checkUpdateButton");
+  check.disabled = status.phase === "checking" || status.phase === "downloading";
+  check.textContent = status.phase === "checking" ? "检查中…" : "检查更新";
+  document.querySelector("#downloadUpdateButton").classList.toggle("hidden", status.phase !== "available" || !status.canAutoInstall);
+  document.querySelector("#installUpdateButton").classList.toggle("hidden", status.phase !== "downloaded" || !status.canAutoInstall);
+  document.querySelector("#updateNote").textContent = status.portable
+    ? "当前为免安装备用版；发现新版时会打开主安装版下载页。"
+    : status.canAutoInstall
+      ? "启动后和每 6 小时自动检查；下载及重启安装均由你确认。"
+      : "当前运行方式不支持程序内安装，可从 GitHub Release 下载新版。";
+}
+
+async function checkForUpdates() {
+  renderUpdateStatus(await desktop.checkForUpdates());
+}
 
 function duration(seconds) {
   const value = Number(seconds || 0);
@@ -37,23 +79,35 @@ function addBucket(target, source) {
 
 function devices() {
   if (!state.snapshot?.local) return [];
-  const local = { id: state.snapshot.local.device.id, name: state.snapshot.local.device.name, online: true, local: true, latencyMs: 0, data: state.snapshot.local };
-  const peers = state.snapshot.peers.filter((peer) => peer.online && peer.data).map((peer) => ({ ...peer, id: peer.data.device?.id || peer.id, name: peer.name || peer.data.device?.name }));
-  return [local, ...peers];
+  const expand = (data, peer = null) => {
+    const hostName = peer?.name || data.device?.name || "未知设备";
+    if (Array.isArray(data.sources) && data.sources.length) {
+      return data.sources.map((source) => ({
+        id: `${data.device?.id || peer?.id}:${source.id}`,
+        name: `${hostName} · ${source.name}`,
+        hostName,
+        sourceName: source.name,
+        online: true,
+        local: !peer,
+        latencyMs: peer?.latencyMs || 0,
+        available: source.available !== false,
+        data: source.data,
+      }));
+    }
+    return [{ id: data.device?.id || peer?.id, name: hostName, hostName, sourceName: "默认数据源", online: true, local: !peer, latencyMs: peer?.latencyMs || 0, available: true, data }];
+  };
+  const local = expand(state.snapshot.local);
+  const peers = state.snapshot.peers.filter((peer) => peer.online && peer.data).flatMap((peer) => expand(peer.data, peer));
+  return [...local, ...peers];
 }
 
-function filteredDevices() {
-  const rows = devices();
-  return state.device === "all" ? rows : rows.filter((device) => device.id === state.device);
+function selectedData() {
+  if (state.device === "all") return state.snapshot.aggregate || state.snapshot.local;
+  return devices().find((device) => device.id === state.device)?.data || state.snapshot.aggregate || state.snapshot.local;
 }
 
-function mergeDaily(deviceRows = filteredDevices()) {
-  const result = {};
-  deviceRows.forEach((device) => device.data.daily.forEach((row) => {
-    result[row.date] ||= emptyBucket(row.date);
-    addBucket(result[row.date], row);
-  }));
-  return Object.values(result).sort((a, b) => a.date.localeCompare(b.date));
+function mergeDaily() {
+  return (selectedData()?.daily || []).map((row) => ({ ...emptyBucket(row.date), ...row }));
 }
 
 function periodBounds(period = state.period) {
@@ -96,13 +150,63 @@ function previousPeriodRows(allRows) {
   return allRows.filter((row) => row.date >= startKey && row.date <= endKey);
 }
 
+function agentTaskName(agentPath) {
+  return String(agentPath || "").split("/").filter(Boolean).at(-1) || "";
+}
+
+function sessionAgentInfo(row) {
+  const spawn = row?.source && typeof row.source === "object" ? row.source?.subagent?.thread_spawn : null;
+  const agentPath = String(row?.agentPath || spawn?.agent_path || "");
+  const isSubagent = row?.threadSource === "subagent" || Boolean(spawn);
+  return {
+    isSubagent,
+    parentThreadId: String(row?.parentThreadId || spawn?.parent_thread_id || ""),
+    rootSessionId: String(row?.rootSessionId || ""),
+    nickname: String(row?.agentNickname || spawn?.agent_nickname || ""),
+    path: agentPath,
+    taskName: String(row?.agentTaskName || agentTaskName(agentPath)),
+    depth: Number(row?.agentDepth ?? spawn?.depth ?? (isSubagent ? 1 : 0)),
+  };
+}
+
+function sessionDisplayTitle(row) {
+  const agent = sessionAgentInfo(row);
+  if (agent.isSubagent) return ["子代理", agent.nickname, agent.taskName].filter(Boolean).join(" · ");
+  return row?.title || "未命名会话";
+}
+
+function rootSessionId(row, sessionMap) {
+  const agent = sessionAgentInfo(row);
+  if (!agent.isSubagent) return row.id;
+  if (agent.rootSessionId && agent.rootSessionId !== row.id) return agent.rootSessionId;
+  let currentId = agent.parentThreadId;
+  const visited = new Set([row.id]);
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId);
+    const current = sessionMap.get(currentId);
+    if (!current) return currentId;
+    const currentAgent = sessionAgentInfo(current);
+    if (!currentAgent.isSubagent) return current.id;
+    if (currentAgent.rootSessionId && currentAgent.rootSessionId !== current.id) return currentAgent.rootSessionId;
+    currentId = currentAgent.parentThreadId;
+  }
+  return agent.parentThreadId || row.id;
+}
+
 function selectedSessions() {
-  let rows = filteredDevices().flatMap((device) => device.data.sessions || []);
+  const complete = [...(selectedData()?.sessions || [])];
+  const sessionMap = new Map(complete.map((row) => [row.id, row]));
+  let rows = [...complete];
   const bounds = periodBounds();
   if (bounds) rows = rows.filter((row) => row.date && row.date >= bounds[0] && row.date <= bounds[1]);
   if (state.query) {
     const query = state.query.toLowerCase();
-    rows = rows.filter((row) => [row.deviceName, row.title, row.model, row.project, row.cwd, row.id].some((value) => String(value || "").toLowerCase().includes(query)));
+    rows = rows.filter((row) => {
+      const agent = sessionAgentInfo(row);
+      const root = sessionMap.get(rootSessionId(row, sessionMap));
+      return [row.deviceName, row.sourceName, sessionDisplayTitle(row), row.title, row.model, row.project, row.cwd, row.id, agent.nickname, agent.taskName, agent.path, root?.title]
+        .some((value) => String(value || "").toLowerCase().includes(query));
+    });
   }
   return rows.sort((a, b) => String(b.endedAt || "").localeCompare(String(a.endedAt || "")));
 }
@@ -110,7 +214,7 @@ function selectedSessions() {
 function renderDevicePicker() {
   const picker = document.querySelector("#devicePicker");
   const previous = state.device;
-  picker.innerHTML = `<option value="all">全部设备（${devices().length}）</option>` + devices().map((device) => `<option value="${escapeHtml(device.id)}">${device.local ? "本机 · " : "远程 · "}${escapeHtml(device.name)}</option>`).join("");
+  picker.innerHTML = `<option value="all">全部来源（${devices().length}）</option>` + devices().map((device) => `<option value="${escapeHtml(device.id)}">${device.local ? "本机 · " : "远程 · "}${escapeHtml(device.name)}</option>`).join("");
   if ([...picker.options].some((option) => option.value === previous)) picker.value = previous;
   else state.device = "all";
 }
@@ -121,19 +225,22 @@ function renderConnectionBanner() {
   const banner = document.querySelector("#connectionBanner");
   if (!state.config.peers.length) {
     banner.className = "connection-banner setup";
-    banner.innerHTML = `<div><strong>尚未连接 Windows 电脑</strong><span>在 Windows 安装并打开本应用，然后在“设备与同步”中添加它的 Tailscale 地址和令牌。</span></div><button data-open-settings>立即连接</button>`;
+    banner.innerHTML = `<div><strong>已汇总 ${devices().length} 个本地数据源</strong><span>Windows 与 WSL 目录会先按会话 ID 全局去重；其他电脑可继续通过 Tailscale 接入。</span></div><button data-open-settings>管理来源</button>`;
   } else if (online < peers.length) {
     const failed = peers.filter((peer) => !peer.online).map((peer) => `${peer.name}：${peer.error}`).join("；");
     banner.className = "connection-banner warning";
     banner.innerHTML = `<div><strong>${online}/${peers.length} 台远程设备在线</strong><span>${escapeHtml(failed)}</span></div><button data-open-settings>检查设置</button>`;
   } else {
     banner.className = "connection-banner connected";
-    banner.innerHTML = `<div><strong>${devices().length} 台设备已汇总</strong><span>Tailscale 加密链路正常，远程统计延迟 ${peers.map((peer) => `${peer.name} ${peer.latencyMs}ms`).join(" · ") || "—"}</span></div><i></i>`;
+    banner.innerHTML = `<div><strong>${devices().length} 个数据源已去重汇总</strong><span>Tailscale 加密链路正常，远程统计延迟 ${peers.map((peer) => `${peer.name} ${peer.latencyMs}ms`).join(" · ") || "—"}</span></div><i></i>`;
   }
 }
 
 function renderCards(rows) {
   const sum = sumRows(rows);
+  const sessions = selectedSessions();
+  const subagentCount = sessions.filter((row) => sessionAgentInfo(row).isSubagent).length;
+  const primaryCount = Math.max(0, sessions.length - subagentCount);
   const nonCached = Math.max(0, sum.input - sum.cached);
   const cacheRate = sum.input ? sum.cached / sum.input * 100 : 0;
   const all = mergeDaily();
@@ -145,10 +252,10 @@ function renderCards(rows) {
     ["非缓存输入", short(nonCached), `占总流量 ${sum.total ? (nonCached / sum.total * 100).toFixed(1) : 0}%`, ""],
     ["缓存输入", short(sum.cached), `缓存命中 ${cacheRate.toFixed(1)}%`, "mint"],
     ["模型输出", short(sum.output), `推理 ${short(sum.reasoning)}`, "orange"],
-    ["会话", number(sum.sessions), `${number(sum.turns)} 轮对话`, ""],
+    ["会话", number(sum.sessions), `${number(primaryCount)} 个主会话 · ${number(subagentCount)} 个子代理`, ""],
     ["工具调用", number(sum.tools), `${Object.keys(sum.toolNames).length} 种工具`, ""],
     ["任务耗时", duration(sum.activeSeconds), `日均 ${duration(sum.activeSeconds / Math.max(1, rows.filter((row) => row.total).length))}`, ""],
-    ["联网设备", number(devices().length), `${state.snapshot.peers.filter((peer) => peer.online).length} 台远程在线`, ""],
+    ["数据源", number(devices().length), `${state.snapshot.peers.filter((peer) => peer.online).length} 台远程在线`, ""],
   ];
   document.querySelector("#metricCards").innerHTML = cards.map(([label, value, foot, type]) => `<article class="metric ${type}"><div class="metric-label">${label}</div><div class="metric-value">${value}</div><div class="metric-foot">${foot}</div></article>`).join("");
 }
@@ -186,7 +293,7 @@ function renderTodayYesterday() {
     ["对话轮次", (row) => row.turns, number],
     ["工具调用", (row) => row.tools, number],
     ["任务耗时", (row) => row.activeSeconds, duration],
-    ["活跃设备", (row) => Object.values(row.devices).filter(Boolean).length, number],
+    ["活跃来源", (row) => Object.values(row.devices).filter(Boolean).length, number],
   ];
   document.querySelector("#dayCompareTable").innerHTML = `<div class="day-compare-row header"><span>指标</span><b>今天</b><b>昨天</b><b>变化</b></div>` + metrics.map(([label, getter, formatter]) => {
     const current = getter(today), previous = getter(yesterday), delta = comparison(current, previous);
@@ -257,7 +364,7 @@ function renderTrend(rows) {
     const tooltip = document.querySelector("#chartTooltip");
     if (index < 0 || index >= rows.length) return tooltip.classList.add("hidden");
     const row = rows[index], value = values[index];
-    tooltip.innerHTML = `<strong>${row.date}</strong><br>总流量 ${number(row.total)}<br>非缓存输入 ${number(value.input)}<br>缓存输入 ${number(value.cached)}<br>输出 ${number(value.output)}<br>设备 ${Object.keys(row.devices).length} 台`;
+    tooltip.innerHTML = `<strong>${row.date}</strong><br>总流量 ${number(row.total)}<br>非缓存输入 ${number(value.input)}<br>缓存输入 ${number(value.cached)}<br>输出 ${number(value.output)}<br>来源 ${Object.keys(row.devices).length} 个`;
     tooltip.style.left = `${Math.min(width - 184, Math.max(0, event.clientX - rect.left + 12))}px`;
     tooltip.style.top = `${Math.max(4, event.clientY - rect.top - 86)}px`;
     tooltip.classList.remove("hidden");
@@ -299,11 +406,11 @@ function renderPeaks(rows) {
   }).sort((a, b) => (b.peak?.total || 0) - (a.peak?.total || 0))[0];
   const items = [
     ["汇总单日峰值", peakDay?.date || "—", peakDay ? `${short(peakDay.total)} tokens` : "暂无数据"],
-    ["设备单日峰值", peakDevice?.name || "—", peakDevice?.peak ? `${peakDevice.peak.date} · ${short(peakDevice.peak.total)}` : "暂无数据"],
-    ["最大会话", peakSession?.title || "—", peakSession ? `${peakSession.deviceName} · ${short(peakSession.total)}` : "暂无数据"],
+    ["来源单日峰值", peakDevice?.name || "—", peakDevice?.peak ? `${peakDevice.peak.date} · ${short(peakDevice.peak.total)}` : "暂无数据"],
+    ["最大会话", peakSession ? sessionDisplayTitle(peakSession) : "—", peakSession ? `${peakSession.originName || peakSession.deviceName} · ${short(peakSession.total)}` : "暂无数据"],
     ["最高流量时段", peakHour ? `${String(peakHour[0]).padStart(2, "0")}:00` : "—", peakHour ? `${short(peakHour[1])} tokens` : "暂无数据"],
     ["最高流量项目", peakProject?.[0] || "—", peakProject ? `${short(peakProject[1])} tokens` : "暂无数据"],
-    ["双机同时活跃", `${simultaneous} 天`, simultaneous ? "两台设备同日产生流量" : "所选范围内暂无重叠"],
+    ["多来源同时活跃", `${simultaneous} 天`, simultaneous ? "多个来源同日产生流量" : "所选范围内暂无重叠"],
   ];
   document.querySelector("#peakGrid").innerHTML = items.map(([label, value, note]) => `<div class="peak-item"><span>${label}</span><strong title="${escapeHtml(value)}">${escapeHtml(value)}</strong><small>${escapeHtml(note)}</small></div>`).join("");
 }
@@ -321,7 +428,7 @@ function renderDeviceComparison() {
     return [device.name, sum.total, peak];
   }).sort((a, b) => b[1] - a[1]);
   const maximum = entries[0]?.[1] || 1;
-  document.querySelector("#deviceComparison").innerHTML = entries.map(([name, value, peak], index) => `<div class="device-row"><div class="device-line"><span class="device-color" style="background:${colors[index % colors.length]}"></span><strong>${escapeHtml(name)}</strong><b>${short(value)}</b></div><div class="device-bar"><i style="width:${Math.max(2, value / maximum * 100)}%;background:${colors[index % colors.length]}"></i></div><small>本机峰值：${peak ? `${peak.date} · ${short(peak.total)}` : "暂无"}</small></div>`).join("");
+  document.querySelector("#deviceComparison").innerHTML = entries.map(([name, value, peak], index) => `<div class="device-row"><div class="device-line"><span class="device-color" style="background:${colors[index % colors.length]}"></span><strong>${escapeHtml(name)}</strong><b>${short(value)}</b></div><div class="device-bar"><i style="width:${Math.max(2, value / maximum * 100)}%;background:${colors[index % colors.length]}"></i></div><small>来源峰值：${peak ? `${peak.date} · ${short(peak.total)}` : "暂无"}</small></div>`).join("");
 }
 
 function renderHourChart(rows) {
@@ -358,15 +465,64 @@ function renderInsights(rows) {
     ["缓存命中率", `${cacheRate.toFixed(1)}%`, cacheRate > 80 ? "上下文复用较高" : "缓存比例偏低"],
     ["输出 / 新输入", outputRate.toFixed(3), "每 1 个新输入 Token 的输出量"],
     ["推理输出占比", `${sum.output ? (sum.reasoning / sum.output * 100).toFixed(1) : 0}%`, `${short(sum.reasoning)} reasoning tokens`],
-    ["主力设备", bestDevice?.[0] || "—", bestDevice ? `${short(bestDevice[1])} tokens` : "暂无数据"],
+    ["主力来源", bestDevice?.[0] || "—", bestDevice ? `${short(bestDevice[1])} tokens` : "暂无数据"],
   ];
   document.querySelector("#insights").innerHTML = items.map(([label, value, note]) => `<div class="insight"><span>${label}</span><strong title="${escapeHtml(value)}">${escapeHtml(value)}</strong><small>${escapeHtml(note)}</small></div>`).join("");
 }
 
 function renderSessions() {
   const all = selectedSessions(), rows = all.slice(0, 300);
-  document.querySelector("#sessionRows").innerHTML = rows.map((row) => `<tr><td><div class="device-tag">${escapeHtml(row.deviceName)}</div><div class="session-name" title="${escapeHtml(row.title)}">${escapeHtml(row.title)}</div></td><td>${localDate(row.startedAt)}</td><td>${escapeHtml(row.project)}</td><td><span class="model-pill">${escapeHtml(row.model)}</span></td><td>${short(Math.max(0, row.input - row.cached))}</td><td>${short(row.cached)}</td><td>${short(row.output)}</td><td>${duration(row.activeSeconds)}</td><td><strong>${short(row.total)}</strong></td></tr>`).join("") || '<tr><td colspan="9" class="empty">没有匹配的会话</td></tr>';
-  document.querySelector("#tableNote").textContent = `显示 ${rows.length} / ${all.length} 个会话`;
+  const complete = [...(selectedData()?.sessions || [])];
+  const sessionMap = new Map(complete.map((row) => [row.id, row]));
+  const groups = new Map();
+  const entries = [];
+
+  for (const row of rows) {
+    const agent = sessionAgentInfo(row);
+    if (!agent.isSubagent) {
+      entries.push({ type: "session", row, endedAt: row.endedAt || "" });
+      continue;
+    }
+    const rootId = rootSessionId(row, sessionMap);
+    if (!groups.has(rootId)) {
+      const group = { type: "group", rootId, root: sessionMap.get(rootId), children: [], endedAt: row.endedAt || "" };
+      groups.set(rootId, group);
+      entries.push(group);
+    }
+    const group = groups.get(rootId);
+    group.children.push(row);
+    if (String(row.endedAt || "") > group.endedAt) group.endedAt = row.endedAt || "";
+  }
+
+  // 根会话已经由父任务分组标题承载，不再重复显示为一条普通会话。
+  const groupedRootIds = new Set(groups.keys());
+  const ordered = entries.filter((entry) => entry.type !== "session" || !groupedRootIds.has(entry.row.id))
+    .sort((a, b) => String(b.endedAt).localeCompare(String(a.endedAt)));
+  const sessionHtml = (row, child = false) => {
+    const title = sessionDisplayTitle(row);
+    const agent = sessionAgentInfo(row);
+    const visibleTitle = child ? [agent.nickname, agent.taskName].filter(Boolean).join(" · ") || title : title;
+    const agentTag = child ? '<span class="subagent-tag">子代理</span>' : "";
+    return `<tr class="${child ? "subagent-row" : ""}"><td><div class="device-tag">${escapeHtml(row.originName || [row.deviceName, row.sourceName].filter(Boolean).join(" · "))}</div><div class="session-title-wrap">${agentTag}<div class="session-name" title="${escapeHtml(title)}">${escapeHtml(visibleTitle)}</div></div></td><td>${localDate(row.startedAt)}</td><td>${escapeHtml(row.project)}</td><td><span class="model-pill">${escapeHtml(row.model)}</span></td><td>${short(Math.max(0, row.input - row.cached))}</td><td>${short(row.cached)}</td><td>${short(row.output)}</td><td>${duration(row.activeSeconds)}</td><td><strong>${short(row.total)}</strong></td></tr>`;
+  };
+  const html = ordered.map((entry) => {
+    if (entry.type === "session") return sessionHtml(entry.row);
+    const root = entry.root;
+    const members = root && rows.some((row) => row.id === root.id) ? [root, ...entry.children] : entry.children;
+    const aggregate = members.reduce((sum, row) => {
+      usageKeys.forEach((key) => { sum[key] += Number(row[key] || 0); });
+      sum.activeSeconds += Number(row.activeSeconds || 0);
+      return sum;
+    }, { input: 0, cached: 0, output: 0, reasoning: 0, total: 0, activeSeconds: 0 });
+    const parentTitle = root?.title && root.title !== "未命名会话" ? root.title : `父任务 ${entry.rootId.slice(0, 8)}`;
+    const project = root?.project || entry.children[0]?.project || "未知项目";
+    const models = [...new Set(members.map((row) => row.model).filter(Boolean))];
+    const expanded = Boolean(state.query) || state.expandedSessionGroups.has(entry.rootId);
+    const header = `<tr class="session-group-row"><td><button class="session-group-toggle" data-session-group="${escapeHtml(entry.rootId)}" aria-expanded="${expanded}"><span class="group-chevron">${expanded ? "▾" : "▸"}</span><span><strong title="${escapeHtml(parentTitle)}">${escapeHtml(parentTitle)}</strong><small>${entry.children.length} 个子代理会话${root ? ` · 父会话 ${root.id.slice(0, 8)}` : ""}</small></span></button></td><td>${localDate(entry.endedAt)}</td><td>${escapeHtml(project)}</td><td><span class="model-pill">${escapeHtml(models.length === 1 ? models[0] : `${models.length} 个模型`)}</span></td><td>${short(Math.max(0, aggregate.input - aggregate.cached))}</td><td>${short(aggregate.cached)}</td><td>${short(aggregate.output)}</td><td>${duration(aggregate.activeSeconds)}</td><td><strong>${short(aggregate.total)}</strong></td></tr>`;
+    return header + (expanded ? entry.children.sort((a, b) => String(b.endedAt || "").localeCompare(String(a.endedAt || ""))).map((row) => sessionHtml(row, true)).join("") : "");
+  }).join("");
+  document.querySelector("#sessionRows").innerHTML = html || '<tr><td colspan="9" class="empty">没有匹配的会话</td></tr>';
+  document.querySelector("#tableNote").textContent = `显示 ${rows.length} / ${all.length} 个会话 · ${groups.size} 个父任务分组 · 子代理默认折叠`;
 }
 
 function render() {
@@ -378,7 +534,14 @@ function render() {
   renderHourChart(rows);
   renderRanking("#toolRanking", sortedMap(sum.toolNames), number);
   renderActivity(rows); renderInsights(rows); renderDailyDetails(); renderSessions();
-  document.querySelector("#subtitle").textContent = `${periodLabel()} · ${devices().length} 台设备 · ${state.snapshot.local.filesScanned} 个本机会话日志 · 每 60 秒自动刷新`;
+  const aggregate = state.snapshot.aggregate || state.snapshot.local;
+  const dedupeText = aggregate.dedupeMode === "partial" ? "部分来源为旧版，跨设备去重受限" : `已排除 ${number(aggregate.duplicateSessions)} 个重复会话副本`;
+  document.querySelector("#subtitle").textContent = `${periodLabel()} · ${devices().length} 个数据源 · ${state.snapshot.local.filesScanned} 个本地日志 · ${dedupeText}`;
+}
+
+function renderSourceEditor() {
+  const sources = state.settingsDraft.sources || [];
+  document.querySelector("#sourceEditor").innerHTML = sources.map((source, index) => `<div class="source-card" data-source-index="${index}"><label><span>来源名称</span><input data-field="name" value="${escapeHtml(source.name)}" placeholder="例如 WSL 或 Windows"></label><label class="wide"><span>.codex 目录</span><div class="input-action"><input data-field="path" value="${escapeHtml(source.path)}"><button type="button" data-choose-source="${index}">选择</button></div></label><label class="source-enabled"><input type="checkbox" data-field="enabled" ${source.enabled !== false ? "checked" : ""}>启用</label><button class="remove-source" data-remove-source="${index}">删除</button></div>`).join("") || '<div class="empty-box">至少添加一个包含 sessions 或 archived_sessions 的 .codex 目录。</div>';
 }
 
 function renderPeerEditor() {
@@ -389,9 +552,12 @@ function renderPeerEditor() {
 function readSettingsForm() {
   if (!state.settingsDraft) return;
   state.settingsDraft.deviceName = document.querySelector("#deviceNameInput").value;
-  state.settingsDraft.codexHome = document.querySelector("#codexHomeInput").value;
   state.settingsDraft.shareEnabled = document.querySelector("#shareEnabledInput").checked;
   state.settingsDraft.sharePort = Number(document.querySelector("#sharePortInput").value);
+  document.querySelectorAll(".source-card").forEach((card) => {
+    const source = state.settingsDraft.sources[Number(card.dataset.sourceIndex)];
+    card.querySelectorAll("[data-field]").forEach((input) => { source[input.dataset.field] = input.type === "checkbox" ? input.checked : input.value; });
+  });
   document.querySelectorAll(".peer-card").forEach((card) => {
     const peer = state.settingsDraft.peers[Number(card.dataset.peerIndex)];
     card.querySelectorAll("[data-field]").forEach((input) => { peer[input.dataset.field] = input.type === "checkbox" ? input.checked : input.value; });
@@ -403,12 +569,12 @@ async function openSettings() {
   const system = await desktop.getSystemInfo();
   state.settingsDraft = structuredClone(state.config);
   document.querySelector("#deviceNameInput").value = state.settingsDraft.deviceName;
-  document.querySelector("#codexHomeInput").value = state.settingsDraft.codexHome;
   document.querySelector("#shareEnabledInput").checked = state.settingsDraft.shareEnabled;
   document.querySelector("#sharePortInput").value = state.settingsDraft.sharePort;
   document.querySelector("#shareAddressText").textContent = system.shareAddress || (system.tailscaleIp ? `http://${system.tailscaleIp}:${state.settingsDraft.sharePort}` : "未检测到 Tailscale 地址");
   document.querySelector("#shareTokenText").textContent = state.settingsDraft.shareToken;
   document.querySelector("#settingsMessage").textContent = system.shareError || "";
+  renderSourceEditor();
   renderPeerEditor();
   document.querySelector("#settingsModal").classList.remove("hidden");
 }
@@ -445,13 +611,32 @@ document.querySelector("#rangePicker").onclick = (event) => {
 };
 document.querySelector("#devicePicker").onchange = (event) => { state.device = event.target.value; render(); };
 document.querySelector("#refreshButton").onclick = () => load(true);
+document.querySelector("#updateButton").onclick = () => {
+  if (state.update?.phase === "downloaded" && state.update.canAutoInstall) desktop.installUpdate();
+  else if (state.update?.phase === "available" && state.update.canAutoInstall) desktop.downloadUpdate();
+  else checkForUpdates();
+};
 document.querySelector("#settingsButton").onclick = openSettings;
+document.querySelector("#checkUpdateButton").onclick = checkForUpdates;
+document.querySelector("#downloadUpdateButton").onclick = async () => renderUpdateStatus(await desktop.downloadUpdate());
+document.querySelector("#installUpdateButton").onclick = () => desktop.installUpdate();
+document.querySelector("#openReleaseButton").onclick = () => desktop.openReleasePage();
 document.querySelector("#sessionSearch").oninput = (event) => { state.query = event.target.value.trim(); renderSessions(); };
+document.querySelector("#sessionRows").onclick = (event) => {
+  const button = event.target.closest("[data-session-group]");
+  if (!button || state.query) return;
+  const groupId = button.dataset.sessionGroup;
+  if (state.expandedSessionGroups.has(groupId)) state.expandedSessionGroups.delete(groupId);
+  else state.expandedSessionGroups.add(groupId);
+  renderSessions();
+};
 document.body.onclick = (event) => {
   if (event.target.closest("[data-open-settings]")) openSettings();
   if (event.target.closest("[data-close-settings]")) closeSettings();
   const remove = event.target.closest("[data-remove-peer]");
   if (remove) { readSettingsForm(); state.settingsDraft.peers.splice(Number(remove.dataset.removePeer), 1); renderPeerEditor(); }
+  const removeSource = event.target.closest("[data-remove-source]");
+  if (removeSource) { readSettingsForm(); state.settingsDraft.sources.splice(Number(removeSource.dataset.removeSource), 1); renderSourceEditor(); }
   const copy = event.target.closest("[data-copy]");
   if (copy) {
     const value = copy.dataset.copy === "token" ? state.settingsDraft.shareToken : document.querySelector("#shareAddressText").textContent;
@@ -459,7 +644,15 @@ document.body.onclick = (event) => {
   }
 };
 document.querySelector("#addPeerButton").onclick = () => { readSettingsForm(); state.settingsDraft.peers.push({ name: "Windows 电脑", address: "", token: "", enabled: true }); renderPeerEditor(); };
-document.querySelector("#chooseHomeButton").onclick = async () => { const chosen = await desktop.chooseCodexHome(); if (chosen) document.querySelector("#codexHomeInput").value = chosen; };
+document.querySelector("#addSourceButton").onclick = () => { readSettingsForm(); state.settingsDraft.sources.push({ name: `数据源 ${state.settingsDraft.sources.length + 1}`, path: "", enabled: true }); renderSourceEditor(); };
+document.querySelector("#sourceEditor").onclick = async (event) => {
+  const choose = event.target.closest("[data-choose-source]");
+  if (!choose) return;
+  readSettingsForm();
+  const chosen = await desktop.chooseCodexHome();
+  if (chosen) state.settingsDraft.sources[Number(choose.dataset.chooseSource)].path = chosen;
+  renderSourceEditor();
+};
 document.querySelector("#regenerateTokenButton").onclick = async () => {
   if (!confirm("重新生成后，其他电脑保存的旧令牌会失效。确定继续吗？")) return;
   const token = await desktop.regenerateToken(); state.settingsDraft.shareToken = token; document.querySelector("#shareTokenText").textContent = token;
@@ -478,7 +671,11 @@ window.onresize = () => state.snapshot && render();
 if (!desktop) {
   document.querySelector("#loading").innerHTML = "<strong>请从桌面应用启动，不要直接打开 HTML 文件。</strong>";
 } else {
-  load();
+  Promise.all([desktop.getUpdateStatus(), load()]).then(([update]) => {
+    state.update = update;
+    renderUpdateStatus();
+    desktop.onUpdateStatus(renderUpdateStatus);
+  });
   setInterval(() => {
     if (state.snapshot && document.querySelector("#settingsModal").classList.contains("hidden")) load(true);
   }, 60000);

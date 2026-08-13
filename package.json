@@ -1,6 +1,6 @@
 {
   "name": "codex-traffic-studio",
-  "version": "2.2.0",
+  "version": "2.3.1",
   "description": "跨 Windows、macOS 和 Linux 的本地 Codex 流量统计桌面应用",
   "private": true,
   "keywords": ["codex", "electron", "token-usage", "tailscale", "analytics"],
@@ -12,12 +12,17 @@
     "node": ">=22.12.0",
     "npm": ">=10"
   },
+  "dependencies": {
+    "electron-updater": "^6.8.9"
+  },
   "scripts": {
     "start": "electron .",
-    "check": "node --check src/main.js && node --check src/preload.js && node --check src/stats.js && node --check src/sync-server.js && node --check static/app.js",
+    "check": "node --check src/main.js && node --check src/preload.js && node --check src/stats.js && node --check src/sync-server.js && node --check src/updater.js && node --check static/app.js",
+    "test": "node --test",
+    "test:ui": "electron scripts/verify-ui.js",
     "verify:release": "node scripts/verify-release-tag.js",
     "dist:linux": "electron-builder --linux AppImage",
-    "dist:win": "electron-builder --win portable",
+    "dist:win": "electron-builder --win nsis portable",
     "dist:mac": "electron-builder --mac dmg zip",
     "pack": "electron-builder --dir"
   },
@@ -29,6 +34,7 @@
     "appId": "com.zzs.codextrafficstudio",
     "productName": "Codex 流量统计",
     "asar": true,
+    "publish": [{ "provider": "github", "owner": "USTC-Astar", "repo": "Token_consumption_statistics" }],
     "files": [
       "src/**/*",
       "static/**/*",
@@ -46,9 +52,19 @@
       "artifactName": "Codex-Traffic-Studio-${version}-${arch}.${ext}"
     },
     "win": {
-      "target": ["portable"],
-      "icon": "build/icon.ico",
-      "artifactName": "Codex-Traffic-Studio-${version}-${arch}.${ext}"
+      "target": ["nsis", "portable"],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "artifactName": "Codex-Traffic-Studio-Setup-${version}-${arch}.${ext}",
+      "oneClick": true,
+      "perMachine": false,
+      "allowElevation": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "portable": {
+      "artifactName": "Codex-Traffic-Studio-Portable-${version}-${arch}.${ext}"
     },
     "mac": {
       "target": ["dmg", "zip"],

@@ -19,8 +19,12 @@
 - **多维分类**：按设备、模型、项目、工具、小时和会话查看用量。
 - **流量峰值**：汇总单日峰值、设备峰值、最大会话、最高流量时段和最高流量项目。
 - **多设备汇总**：通过 Tailscale 连接 Windows、macOS 和 Linux 电脑，统一查看各设备和汇总数据。
+- **多目录汇总**：一台电脑可同时读取多套 `.codex`，例如 WSL 的 `~/.codex` 与 Windows 的 `%USERPROFILE%\.codex`。
+- **子代理归组**：识别 Codex 自动派生的子代理会话，显示代理昵称和任务名，并折叠到对应父任务下。
+- **全局会话去重**：本机目录和新版远程设备先按会话 ID 选择最新、最完整的副本，再重新计算每日与分类统计。
 - **增量扫描**：只有新增或变化的 JSONL 文件会被重新解析。
 - **自动刷新**：应用打开后每 60 秒进行一次增量刷新。
+- **自动更新**：安装版启动后检查 GitHub Release，可在应用内下载并确认重启安装；免安装版保留为备用下载。
 - **本地优先**：不读取 API 密钥，不上传提示词正文或模型回复正文。
 
 ## 下载与安装
@@ -29,13 +33,21 @@
 
 ### Windows 10/11 x64
 
-下载：
+推荐下载支持自动更新的主安装版：
 
 ```text
-Codex-Traffic-Studio-<版本>-x64.exe
+Codex-Traffic-Studio-Setup-<版本>-x64.exe
 ```
 
-这是便携版程序，双击即可运行，不需要安装。当前自动构建版本没有商业代码签名，Microsoft Defender SmartScreen 可能显示“无法识别的应用”。请确认文件来自正式 Release，并使用同一 Release 中的 SHA-256 文件校验。
+安装后程序会在启动约 3 秒后检查 GitHub Release，并每 6 小时再次检查。发现新版时由用户确认下载；下载完成后点击“重启并安装”。不会静默强制重启。
+
+如果不希望安装，也可下载备用免安装版：
+
+```text
+Codex-Traffic-Studio-Portable-<版本>-x64.exe
+```
+
+免安装版可以检查是否有新版，但 Windows 便携程序无法可靠地原地替换正在运行的 EXE，因此会打开 Release 下载页获取主安装版。当前自动构建没有商业代码签名，Microsoft Defender SmartScreen 可能显示“无法识别的应用”。请确认文件来自正式 Release，并使用同一 Release 中的 SHA-256 文件校验。
 
 ### Linux x64
 
@@ -88,7 +100,19 @@ xattr -dr com.apple.quarantine "/Applications/Codex 流量统计.app"
 | Windows | `%USERPROFILE%\.codex` |
 | macOS | `~/.codex` |
 
-如果 Codex 使用了其他目录，可在应用的“设备与同步”中手动选择 `.codex` 文件夹。
+如果 Codex 使用了其他目录，可在应用的“来源与同步”中手动添加 `.codex` 文件夹。
+
+同一台电脑有 Windows 与 WSL 时，应用会自动发现可访问的数据目录：
+
+```text
+/home/<Linux 用户>/.codex
+/mnt/c/Users/<Windows 用户>/.codex
+\\wsl.localhost\<WSL 发行版>\home\<Linux 用户>\.codex
+```
+
+从 Windows 桌面版启动时，需要对应 WSL 发行版正在运行，才能自动发现它的目录；例如先打开 ROS1-Noetic 终端，再启动本应用。旧版配置首次迁移后，发现的 Windows 与 WSL 目录会一起保存到设置中。
+
+也可以在“来源与同步 → 本地数据源”中添加任意多个目录并为它们命名。多个目录中出现相同会话 ID 时，优先保留 Token 与活动记录更完整的副本；完整度相同时再选择结束时间更新的副本，避免归档、复制、截断日志或跨系统共享产生重复流量。
 
 应用配置和增量缓存保存在 Electron 用户数据目录：
 
@@ -102,7 +126,7 @@ xattr -dr com.apple.quarantine "/Applications/Codex 流量统计.app"
 
 两台电脑使用相同的 OpenAI 账号或密钥，并不会自动合并本地日志。详细会话数据仍分别保存在各自的 `.codex` 目录中。
 
-本应用的做法类似“每台电脑先计算自己的账单，再通过安全通道交换汇总结果”，而不是把两台电脑的原始日志复制到一起。
+本应用的做法类似“每台电脑先整理自己的逐会话账单，再通过安全通道交换这些账单的统计版本”，而不是把原始日志复制到一起。新版设备会在汇总端再次按会话 ID 去重；连接旧版设备时，因为旧版缺少会话级日统计，只能兼容性相加，界面会明确提示“跨设备去重受限”。
 
 ### 前提
 
@@ -112,7 +136,7 @@ xattr -dr com.apple.quarantine "/Applications/Codex 流量统计.app"
 
 ### 操作步骤
 
-1. 在被统计的电脑上打开“设备与同步”。
+1. 在被统计的电脑上打开“来源与同步”。
 2. 复制该电脑显示的 Tailscale 地址和本机访问令牌。
 3. 在汇总电脑中点击“添加设备”。
 4. 填写设备名称、Tailscale 地址和访问令牌。
@@ -135,6 +159,7 @@ http://<设备的-Tailscale-IP>:18765
 - **模型输出**：日志中的 `output_tokens`。
 - **推理输出**：`reasoning_output_tokens`，单独展示但不重复加入总流量。
 - **每日流量**：对会话累计 Token 做相邻差分后，按事件发生日期归集，避免重复统计。
+- **重复会话**：先比较 Token 总量与轮次/工具活动，再以结束时间作为平局条件，选择更完整的副本。
 - **任务耗时**：任务开始到任务完成/中止事件的时间差，可能包含命令执行、网络等待或用户确认时间。
 - **会话日期**：按会话开始日期统计会话数量。
 
@@ -167,6 +192,7 @@ http://<设备的-Tailscale-IP>:18765
 ```bash
 npm ci
 npm run check
+npm test
 npm start
 ```
 
@@ -174,16 +200,19 @@ npm start
 
 - `npm ci` 完成依赖安装。
 - `npm run check` 不输出 JavaScript 语法错误。
+- `npm test` 的多目录、跨设备去重测试全部通过。
 - `npm start` 打开独立桌面窗口。
 
 ## 测试与安全检查
 
 ```bash
 npm run check
+npm test
+npm run test:ui
 npm audit --audit-level=high
 ```
 
-项目目前以语法检查、真实日志解析验证、跨平台打包验证和依赖安全审计为主，尚未建立完整的自动化单元测试套件。
+项目目前包含统计解析、跨目录/跨设备去重、子代理模型兼容和自动更新状态的自动化测试，并以真实日志解析、界面验收、跨平台打包验证和依赖安全审计补充覆盖。
 
 ## 构建安装包
 
@@ -199,7 +228,7 @@ npm run dist:linux
 
 输出目录：`dist/`。
 
-### Windows 便携版
+### Windows 安装版与免安装版
 
 在 Windows PowerShell 中运行：
 
@@ -209,7 +238,7 @@ npm run check
 npm run dist:win
 ```
 
-输出目录：`dist`。
+输出目录：`dist`。其中 `Setup` 是支持程序内自动更新的主版本，`Portable` 是备用免安装版本；同时生成 `latest.yml` 和 blockmap 更新元数据。
 
 ### macOS DMG 与 ZIP
 
@@ -233,22 +262,24 @@ npm run dist:mac -- --x64
 
 仓库包含 GitHub Actions：
 
-- `CI`：在 Windows、macOS 和 Linux 上对 Push 和 Pull Request 执行依赖安装、语法检查和高危漏洞审计。
-- `Release`：推送 `v*` 标签后，构建 Windows EXE、Linux AppImage，以及 macOS ARM64/x64 的 DMG 和 ZIP，生成 SHA-256 并上传到 GitHub Release。
+- `CI`：在 Windows、macOS 和 Linux 上对 Push 和 Pull Request 执行依赖安装、语法检查、自动化测试和高危漏洞审计。
+- `Release`：推送 `v*` 标签后，构建 Windows NSIS 安装版与便携版、Linux AppImage，以及 macOS ARM64/x64 的 DMG 和 ZIP，并上传自动更新元数据、blockmap 和 SHA-256。
 
-发布新版本前，先更新 `package.json` 和 `CHANGELOG.md`。例如发布 `2.2.0`：
+程序内更新依赖 GitHub Release，因此仓库至少发布过一个正式 Release 后才会真正下载更新；在此之前“检查更新”会明确显示“GitHub 尚未发布可用版本”。只修改本地源码或推送普通分支不会更新已安装程序。
+
+发布新版本前，先更新 `package.json` 和 `CHANGELOG.md`。例如发布 `2.4.0`：
 
 ```bash
-npm version 2.2.0 --no-git-tag-version
+npm version 2.4.0 --no-git-tag-version
 npm run check
-npm run verify:release -- v2.2.0
+npm run verify:release -- v2.4.0
 ```
 
 完成代码审查和提交后再创建并推送标签：
 
 ```bash
-git tag v2.2.0
-git push origin v2.2.0
+git tag v2.4.0
+git push origin v2.4.0
 ```
 
 ## 项目结构
@@ -261,6 +292,7 @@ git push origin v2.2.0
 │   ├── main.js            # Electron 主进程、配置和远程设备连接
 │   ├── preload.js         # 安全的渲染进程 API
 │   ├── stats.js           # Codex JSONL 增量解析和统计
+│   ├── updater.js         # GitHub Release 检查、下载和安装状态
 │   └── sync-server.js     # Tailscale 同步接口
 ├── static/                # 桌面界面和图表
 ├── .github/workflows/     # CI 与自动发布
@@ -284,11 +316,14 @@ git push origin v2.2.0
 ## 已知限制
 
 - Windows 自动构建版本未使用商业代码签名证书，可能触发 SmartScreen。
+- 自动更新只读取本仓库的公开 GitHub Release；当前仓库尚无 Release 时只能完成检查，不能下载更新。
 - macOS 自动构建版本未进行 Apple Developer ID 签名和公证，首次打开可能被 Gatekeeper 阻止。
 - 远程电脑关机、应用关闭、Tailscale 离线或令牌错误时，只显示在线设备数据。
 - 同步会包含会话标题和项目路径等元数据，使用前请阅读 [SECURITY.md](SECURITY.md)。
 - 当前不提供价格/成本估算，因为不同套餐、模型和第三方提供商的计价方式可能造成误导。
 - 当前只支持读取 Codex JSONL 会话日志，不统计其他 AI 编程工具。
+- 账号/组织 Usage API 尚未作为数据源；本地日志仍是项目、工具、耗时和设备维度的主要依据。
+- 与旧版远程客户端混用时可以显示总量，但只有双方都升级到包含本次改进的版本后，才能进行精确的跨设备会话去重。
 
 ## 贡献
 

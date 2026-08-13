@@ -1,14 +1,16 @@
-const { app, BrowserWindow, ipcMain, dialog } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
+const { autoUpdater } = require("electron-updater");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const crypto = require("crypto");
 const http = require("http");
 const https = require("https");
-const { execFile } = require("child_process");
+const { execFile, execFileSync } = require("child_process");
 const { promisify } = require("util");
-const { scanCodexData } = require("./stats");
+const { scanCodexData, combineStatsData } = require("./stats");
 const { SyncServer } = require("./sync-server");
+const { UpdateController } = require("./updater");
 
 const execFileAsync = promisify(execFile);
 let mainWindow;
@@ -17,17 +19,90 @@ let localStats;
 let peerResults = [];
 let refreshing = null;
 let systemInfo = {};
-const syncServer = new SyncServer(async () => localStats);
+let updateController;
+let updateTimer;
+const syncServer = new SyncServer(async () => statsForSharing(localStats));
 
 function configPath() {
   return path.join(app.getPath("userData"), "config.json");
+}
+
+function sourceId(sourcePath) {
+  return `source-${crypto.createHash("sha256").update(sourcePath).digest("hex").slice(0, 12)}`;
+}
+
+function isWsl() {
+  return process.platform === "linux" && (Boolean(process.env.WSL_DISTRO_NAME) || /microsoft/i.test(os.release()));
+}
+
+function runningWslDistributions() {
+  if (process.platform !== "win32") return [];
+  try {
+    // wsl.exe 的列表输出通常是 UTF-16LE；保留 UTF-8 回退以兼容未来版本或非标准环境。
+    const output = execFileSync("wsl.exe", ["--list", "--running", "--quiet"], {
+      timeout: 3000,
+      windowsHide: true,
+    });
+    const text = output.toString(output.includes(0) ? "utf16le" : "utf8").replaceAll("\0", "");
+    return [...new Set(text.split(/\r?\n/).map((name) => name.replace(/^\uFEFF/, "").trim()).filter(Boolean))];
+  } catch {
+    // 没安装 WSL、没有正在运行的发行版或命令超时时，仍正常读取 Windows 本机目录。
+    return [];
+  }
+}
+
+function discoveredSources() {
+  const rows = [];
+  const add = (name, sourcePath) => {
+    try {
+      const resolved = path.resolve(sourcePath);
+      if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) return;
+      const key = process.platform === "win32" ? resolved.toLowerCase() : resolved;
+      if (rows.some((row) => row.key === key)) return;
+      rows.push({ id: sourceId(resolved), name, path: resolved, enabled: true, key });
+    } catch {
+      // Windows 系统用户目录可能不可访问；自动发现失败时跳过，用户仍可手动添加。
+    }
+  };
+
+  add(isWsl() ? "WSL" : "本机", process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
+  if (process.platform === "win32") {
+    for (const distro of runningWslDistributions()) {
+      const distroRoot = `\\\\wsl.localhost\\${distro}`;
+      try {
+        for (const entry of fs.readdirSync(path.join(distroRoot, "home"), { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue;
+          add(`WSL · ${distro} · ${entry.name}`, path.join(distroRoot, "home", entry.name, ".codex"));
+        }
+        add(`WSL · ${distro} · root`, path.join(distroRoot, "root", ".codex"));
+      } catch {
+        // 发行版可能正在关闭或文件共享暂时不可用；下次迁移或手动添加时仍可接入。
+      }
+    }
+  }
+  if (process.platform === "linux" && fs.existsSync("/mnt/c/Users")) {
+    // WSL 可以直接读取 Windows 用户目录，因此默认把现有的 Windows .codex 一并纳入统计。
+    try {
+      for (const entry of fs.readdirSync("/mnt/c/Users", { withFileTypes: true })) {
+        if (!entry.isDirectory() || ["All Users", "Default", "Default User", "Public"].includes(entry.name)) continue;
+        add(`Windows · ${entry.name}`, path.join("/mnt/c/Users", entry.name, ".codex"));
+      }
+    } catch {
+      // 某些 WSL 挂载策略不允许枚举 Windows 用户目录，此时保留手动添加能力。
+    }
+  }
+  if (!rows.length) {
+    const fallback = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
+    rows.push({ id: sourceId(fallback), name: "本机", path: fallback, enabled: true, key: fallback });
+  }
+  return rows.map(({ key, ...row }) => row);
 }
 
 function defaultConfig() {
   return {
     deviceId: crypto.randomUUID(),
     deviceName: os.hostname(),
-    codexHome: process.env.CODEX_HOME || path.join(os.homedir(), ".codex"),
+    sources: discoveredSources(),
     shareEnabled: true,
     sharePort: 18765,
     shareToken: crypto.randomBytes(24).toString("hex"),
@@ -37,7 +112,22 @@ function defaultConfig() {
 
 function loadConfig() {
   try {
-    return { ...defaultConfig(), ...JSON.parse(fs.readFileSync(configPath(), "utf8")) };
+    const defaults = defaultConfig();
+    const saved = JSON.parse(fs.readFileSync(configPath(), "utf8"));
+    const next = { ...defaults, ...saved };
+    if (!Array.isArray(saved.sources) || !saved.sources.length) {
+      // 2.x 版本只保存一个 codexHome。迁移时保留该目录，同时补充自动发现的 Windows/WSL 数据源。
+      const legacyPath = path.resolve(saved.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
+      const discovered = discoveredSources();
+      const legacy = { id: sourceId(legacyPath), name: discovered.find((source) => source.path === legacyPath)?.name || "本机", path: legacyPath, enabled: true };
+      next.sources = [legacy, ...discovered.filter((source) => source.path !== legacyPath)];
+    }
+    if (isWsl()) {
+      const linuxHome = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
+      next.sources = next.sources.map((source) => source.path === linuxHome && source.name === "本机" ? { ...source, name: "WSL" } : source);
+    }
+    delete next.codexHome;
+    return sanitizeConfig(next);
   } catch {
     return defaultConfig();
   }
@@ -106,6 +196,26 @@ function fetchJson(url, token) {
   });
 }
 
+function statsForSharing(stats) {
+  if (!stats) return stats;
+  const sanitizeData = (data) => ({
+    ...data,
+    codexHome: "",
+    source: data.source ? { ...data.source, path: "" } : data.source,
+    sessions: (data.sessions || []).map(({ sourcePath, ...session }) => session),
+  });
+  return {
+    ...sanitizeData(stats),
+    sources: (stats.sources || []).map((source) => ({
+      id: source.id,
+      name: source.name,
+      enabled: source.enabled,
+      available: source.available,
+      data: sanitizeData(source.data),
+    })),
+  };
+}
+
 async function fetchPeer(peer) {
   const started = Date.now();
   try {
@@ -142,7 +252,7 @@ async function refreshStats() {
   refreshing = (async () => {
     const cachePath = path.join(app.getPath("userData"), "scan-cache.json");
     localStats = await scanCodexData({
-      codexHome: config.codexHome,
+      sources: config.sources,
       cachePath,
       device: { id: config.deviceId, name: config.deviceName },
     });
@@ -153,10 +263,13 @@ async function refreshStats() {
 }
 
 function snapshot() {
+  const onlinePeerData = peerResults.filter((peer) => peer.online && peer.data).map((peer) => peer.data);
+  const aggregate = localStats ? combineStatsData([localStats, ...onlinePeerData], { dedupeMode: "exact" }) : null;
   return {
     refreshing: Boolean(refreshing),
     local: localStats,
     peers: peerResults,
+    aggregate,
     system: systemInfo,
   };
 }
@@ -164,7 +277,25 @@ function snapshot() {
 function sanitizeConfig(input) {
   const next = { ...config, ...input };
   next.deviceName = String(next.deviceName || os.hostname()).trim().slice(0, 80);
-  next.codexHome = String(next.codexHome || path.join(os.homedir(), ".codex"));
+  const seenPaths = new Set();
+  next.sources = (Array.isArray(next.sources) ? next.sources : discoveredSources()).map((source, index) => {
+    const rawPath = String(source.path || "").trim();
+    if (!rawPath) return null;
+    const sourcePath = path.resolve(rawPath);
+    const pathKey = process.platform === "win32" ? sourcePath.toLowerCase() : sourcePath;
+    if (!sourcePath || seenPaths.has(pathKey)) return null;
+    seenPaths.add(pathKey);
+    return {
+      id: String(source.id || sourceId(sourcePath)),
+      name: String(source.name || `数据源 ${index + 1}`).trim().slice(0, 80),
+      path: sourcePath,
+      enabled: source.enabled !== false,
+    };
+  }).filter(Boolean);
+  if (!next.sources.length) {
+    const fallback = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
+    next.sources = [{ id: sourceId(fallback), name: "本机", path: fallback, enabled: true }];
+  }
   next.sharePort = Math.min(65535, Math.max(1024, Number(next.sharePort) || 18765));
   next.peers = Array.isArray(next.peers) ? next.peers.map((peer) => ({
     id: peer.id || crypto.randomUUID(),
@@ -181,6 +312,11 @@ function registerIpc() {
   ipcMain.handle("stats:refresh", refreshStats);
   ipcMain.handle("config:get", () => config);
   ipcMain.handle("system:get", detectSystemInfo);
+  ipcMain.handle("updates:get", () => updateController.snapshot());
+  ipcMain.handle("updates:check", () => updateController.check({ manual: true }));
+  ipcMain.handle("updates:download", () => updateController.download());
+  ipcMain.handle("updates:install", () => updateController.install());
+  ipcMain.handle("updates:open-release", () => updateController.openReleasePage());
   ipcMain.handle("config:choose-codex-home", async () => {
     const result = await dialog.showOpenDialog(mainWindow, { properties: ["openDirectory"], title: "选择 Codex 数据目录（.codex）" });
     return result.canceled ? null : result.filePaths[0];
@@ -201,6 +337,7 @@ function registerIpc() {
 }
 
 function createWindow() {
+  const windowIcon = path.join(__dirname, "..", "build", process.platform === "win32" ? "icon.ico" : "icon.png");
   mainWindow = new BrowserWindow({
     width: 1500,
     height: 980,
@@ -209,6 +346,7 @@ function createWindow() {
     title: "Codex 流量统计",
     backgroundColor: "#f4f6f1",
     autoHideMenuBar: true,
+    icon: windowIcon,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -216,16 +354,42 @@ function createWindow() {
       sandbox: true,
     },
   });
+  if (process.env.CODEX_TRAFFIC_VERIFY_UI === "1") {
+    mainWindow.webContents.on("did-finish-load", () => mainWindow.webContents.executeJavaScript(`
+      window.__verificationErrors = [];
+      window.addEventListener("error", (event) => window.__verificationErrors.push(event.message));
+      window.addEventListener("unhandledrejection", (event) => window.__verificationErrors.push(String(event.reason)));
+    `));
+  }
   mainWindow.loadFile(path.join(__dirname, "..", "static", "index.html"));
 }
 
 app.whenReady().then(async () => {
   config = loadConfig();
   saveConfig();
+  updateController = new UpdateController({
+    updater: autoUpdater,
+    appVersion: app.getVersion(),
+    platform: process.platform,
+    isPackaged: app.isPackaged,
+    isPortable: Boolean(process.env.PORTABLE_EXECUTABLE_FILE),
+    isAppImage: Boolean(process.env.APPIMAGE),
+    openExternal: (url) => shell.openExternal(url),
+  });
+  updateController.initialize();
+  updateController.on("status", (status) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("updates:status", status);
+  });
   registerIpc();
   await restartShareServer();
   createWindow();
   refreshStats().catch((error) => dialog.showErrorBox("读取 Codex 数据失败", error.message));
+  // 启动后稍作延迟再检查，避免网络请求与首次日志扫描争抢磁盘和界面启动时间。
+  if (updateController.snapshot().supported) {
+    setTimeout(() => updateController.check({ manual: false }), 3000);
+    updateTimer = setInterval(() => updateController.check({ manual: false }), 6 * 60 * 60 * 1000);
+    updateTimer.unref?.();
+  }
   app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 
@@ -233,4 +397,9 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-app.on("before-quit", () => syncServer.stop());
+app.on("before-quit", () => {
+  if (updateTimer) clearInterval(updateTimer);
+  syncServer.stop();
+});
+
+module.exports = { getMainWindow: () => mainWindow, statsForSharing };
