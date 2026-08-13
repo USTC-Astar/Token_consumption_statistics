@@ -4,9 +4,10 @@ const readline = require("readline");
 const os = require("os");
 
 const USAGE_KEYS = ["input", "cached", "output", "reasoning", "total"];
-const CACHE_VERSION = 6;
-const SCHEMA_VERSION = 5;
+const CACHE_VERSION = 7;
+const SCHEMA_VERSION = 6;
 const EXACT_BREAKDOWN_SCHEMA_VERSION = 4;
+const FAMILY_DEDUPE_SCHEMA_VERSION = 5;
 
 function emptyUsage() {
   return { input: 0, cached: 0, output: 0, reasoning: 0, total: 0 };
@@ -195,7 +196,8 @@ function collectSessionFiles(codexHome) {
 }
 
 async function parseSessionFile(filePath) {
-  let sessionId = path.basename(filePath, ".jsonl");
+  const fileName = path.basename(filePath, ".jsonl");
+  let sessionId = fileName;
   let startedAt = null;
   let endedAt = null;
   let cwd = "";
@@ -336,6 +338,9 @@ async function parseSessionFile(filePath) {
   return {
     session: {
       id: sessionId,
+      // Codex 恢复或派生线程时可能复制旧 session_meta，但文件名会换成新线程 ID。
+      // 文件名仍以当前会话 ID 结尾的记录才是持续追加的主日志，日分布也最完整。
+      isCanonicalLog: fileName.endsWith(sessionId),
       startedAt,
       endedAt,
       date: startParts?.date || null,
@@ -438,8 +443,11 @@ function recordRank(record) {
   const ended = Date.parse(record.session?.endedAt || "") || 0;
   const total = Number(record.session?.total || 0);
   const activity = Number(record.session?.turns || 0) + Number(record.session?.tools || 0);
-  // 相同会话可能同时出现在活动目录、归档目录或另一套系统中。Token 总量和活动记录更能代表“完整副本”，结束时间仅作为最终平局条件。
-  return [total, activity, ended];
+  const activeDays = Object.values(record.daily || {}).filter((bucket) => Number(bucket?.total || 0) > 0).length;
+  const canonical = record.session?.isCanonicalLog ? 1 : 0;
+  // 同一 ID 的快照副本可能总量略大，却把历史累计量全部记在复制当天。
+  // 因此优先选择持续追加的主日志，其次比较覆盖天数、Token、活动记录和结束时间。
+  return [canonical, activeDays, total, activity, ended];
 }
 
 function isRecordNewer(candidate, current) {
@@ -451,15 +459,48 @@ function isRecordNewer(candidate, current) {
   return false;
 }
 
+function sessionFamilyId(record) {
+  const session = record.session || {};
+  const agent = subagentInfo(session);
+  // 新版 Codex 的主会话和子代理会写入同一份线程累计 Token。
+  // 因此 rootSessionId 相同的记录不是可相加的独立用量，而是同一累计值在不同线程中的镜像。
+  return String(agent.rootSessionId || (agent.isSubagent ? agent.parentThreadId : "") || session.id || "");
+}
+
+function isPrimaryFamilyRecord(record, familyId) {
+  const session = record.session || {};
+  return !subagentInfo(session).isSubagent && String(session.id || "") === familyId;
+}
+
+function isFamilyRecordBetter(candidate, current, familyId) {
+  const candidatePrimary = isPrimaryFamilyRecord(candidate, familyId);
+  const currentPrimary = isPrimaryFamilyRecord(current, familyId);
+  // 主会话已经包含整棵子代理树的线程累计 Token；存在主会话时不能再用子代理镜像替代它。
+  if (candidatePrimary !== currentPrimary) return candidatePrimary;
+  return isRecordNewer(candidate, current);
+}
+
 function dedupeRecords(records) {
-  const unique = new Map();
+  const uniqueSessions = new Map();
   for (const record of records) {
     const id = record.session?.id;
     if (!id) continue;
-    const current = unique.get(id);
-    if (!current || isRecordNewer(record, current)) unique.set(id, record);
+    const current = uniqueSessions.get(id);
+    if (!current || isRecordNewer(record, current)) uniqueSessions.set(id, record);
   }
-  return { records: [...unique.values()], duplicateSessions: Math.max(0, records.length - unique.size) };
+
+  const uniqueFamilies = new Map();
+  for (const record of uniqueSessions.values()) {
+    const familyId = sessionFamilyId(record);
+    if (!familyId) continue;
+    const current = uniqueFamilies.get(familyId);
+    // 同一根任务优先保留主会话；主会话缺失时，才在子代理中选择最完整的一份。
+    if (!current || isFamilyRecordBetter(record, current, familyId)) uniqueFamilies.set(familyId, record);
+  }
+  return {
+    records: [...uniqueFamilies.values()],
+    duplicateSessions: Math.max(0, records.length - uniqueFamilies.size),
+  };
 }
 
 function mergeHourOrWeek(target, source) {
@@ -574,12 +615,14 @@ function mergeLegacyStats(target, legacy) {
 function combineStatsData(statsRows, metadata = {}) {
   const exactRecords = [];
   const legacyRows = [];
+  let familyDedupeLimited = false;
   for (const stats of statsRows.filter(Boolean)) {
     const sessions = stats.sessions || [];
-    // 版本 5 只增加子代理元数据；版本 4 已经具备精确去重所需的会话级日统计。
+    // 版本 4 已有会话级日统计，可以按会话 ID 去重；版本 5 才包含根会话关系，能继续消除子代理累计镜像。
     const exact = Number(stats.schemaVersion || 0) >= EXACT_BREAKDOWN_SCHEMA_VERSION && sessions.every((session) => session?.breakdown?.daily);
     if (exact) {
       exactRecords.push(...sessions.map(recordFromSession).filter(Boolean));
+      if (Number(stats.schemaVersion || 0) < FAMILY_DEDUPE_SCHEMA_VERSION) familyDedupeLimited = true;
     } else {
       // 旧版远程端没有会话级日统计，无法安全地从总数中减掉重复会话，只能兼容性相加。
       legacyRows.push(stats);
@@ -590,7 +633,7 @@ function combineStatsData(statsRows, metadata = {}) {
     filesScanned: statsRows.reduce((sum, stats) => sum + Number(stats?.filesScanned || 0), 0),
     reparsedFiles: statsRows.reduce((sum, stats) => sum + Number(stats?.reparsedFiles || 0), 0),
     duplicateSessions: statsRows.reduce((sum, stats) => sum + Number(stats?.duplicateSessions || 0), 0),
-    dedupeMode: legacyRows.length ? "partial" : "exact",
+    dedupeMode: legacyRows.length || familyDedupeLimited ? "partial" : "exact",
   });
   for (const legacy of legacyRows) mergeLegacyStats(result, legacy);
   return result;

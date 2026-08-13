@@ -535,7 +535,7 @@ function render() {
   renderRanking("#toolRanking", sortedMap(sum.toolNames), number);
   renderActivity(rows); renderInsights(rows); renderDailyDetails(); renderSessions();
   const aggregate = state.snapshot.aggregate || state.snapshot.local;
-  const dedupeText = aggregate.dedupeMode === "partial" ? "部分来源为旧版，跨设备去重受限" : `已排除 ${number(aggregate.duplicateSessions)} 个重复会话副本`;
+  const dedupeText = aggregate.dedupeMode === "partial" ? "部分来源为旧版，跨设备或子代理去重受限" : `已排除 ${number(aggregate.duplicateSessions)} 个重复副本/子代理累计镜像`;
   document.querySelector("#subtitle").textContent = `${periodLabel()} · ${devices().length} 个数据源 · ${state.snapshot.local.filesScanned} 个本地日志 · ${dedupeText}`;
 }
 
