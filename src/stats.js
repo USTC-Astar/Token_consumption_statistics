@@ -4,10 +4,10 @@ const readline = require("readline");
 const os = require("os");
 
 const USAGE_KEYS = ["input", "cached", "output", "reasoning", "total"];
-const CACHE_VERSION = 8;
-const SCHEMA_VERSION = 7;
+const CACHE_VERSION = 11;
+const SCHEMA_VERSION = 10;
 const EXACT_BREAKDOWN_SCHEMA_VERSION = 4;
-const SUBAGENT_BASELINE_SCHEMA_VERSION = 7;
+const TOKEN_EVENT_SCHEMA_VERSION = 10;
 
 function emptyUsage() {
   return { input: 0, cached: 0, output: 0, reasoning: 0, total: 0 };
@@ -85,19 +85,85 @@ function lastTokenValues(info) {
 
 function usageValues(usage) {
   const value = usage || {};
+  const input = Math.max(0, Number(value.input_tokens || 0));
+  const cached = Math.max(0, Number(value.cached_input_tokens ?? value.cache_read_input_tokens ?? 0));
+  const output = Math.max(0, Number(value.output_tokens || 0));
+  const reasoning = Math.max(0, Number(value.reasoning_output_tokens || 0));
+  const reportedTotal = Number(value.total_tokens);
   return {
-    input: Number(value.input_tokens || 0),
-    cached: Number(value.cached_input_tokens || 0),
-    output: Number(value.output_tokens || 0),
-    reasoning: Number(value.reasoning_output_tokens || 0),
-    total: Number(value.total_tokens || 0),
+    input,
+    cached,
+    output,
+    reasoning,
+    // Codex 的 cached 属于 input、reasoning 属于 output，不能再次加到总量中。
+    total: Number.isFinite(reportedTotal) && reportedTotal >= 0 ? reportedTotal : input + output,
   };
 }
 
 function usageDelta(current, previous) {
-  // Codex 日志记录的是“会话累计值”。只有做相邻差分，才不会把同一批 Token 重复统计。
-  if (current.total < previous.total) return { ...current };
-  return Object.fromEntries(USAGE_KEYS.map((key) => [key, Math.max(0, current[key] - previous[key])]));
+  if (USAGE_KEYS.some((key) => current[key] < previous[key])) return null;
+  return Object.fromEntries(USAGE_KEYS.map((key) => [key, current[key] - previous[key]]));
+}
+
+function sameUsage(left, right) {
+  return USAGE_KEYS.every((key) => Number(left?.[key] || 0) === Number(right?.[key] || 0));
+}
+
+function usageWithin(current, baseline) {
+  return USAGE_KEYS.every((key) => Number(current?.[key] || 0) <= Number(baseline?.[key] || 0));
+}
+
+function looksLikeStaleRegression(current, previous, last) {
+  if (!current.total || !previous.total || !last.total) return false;
+  // Codex 偶尔会把稍旧的累计快照乱序写入。回退不足约 2%，或差值不超过两次最近增量时，
+  // 应忽略这条旧快照；否则下一条恢复到高水位时会把 last_token_usage 重复计算。
+  return current.total * 100 >= previous.total * 98 || current.total + last.total * 2 >= previous.total;
+}
+
+function addUsageCopy(left, right) {
+  return Object.fromEntries(USAGE_KEYS.map((key) => [key, Number(left?.[key] || 0) + Number(right?.[key] || 0)]));
+}
+
+function uuidV7Timestamp(id) {
+  const match = String(id || "").match(/^([0-9a-f]{8})-([0-9a-f]{4})-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+  return match ? Number.parseInt(`${match[1]}${match[2]}`, 16) : null;
+}
+
+function forkParentId(payload) {
+  const spawn = payload?.source && typeof payload.source === "object"
+    ? payload.source?.subagent?.thread_spawn
+    : null;
+  return String(payload?.forked_from_id || payload?.parent_thread_id || spawn?.parent_thread_id || "");
+}
+
+function forkTaskStartsOwnSession({ childSessionId, turnId, startedAt }) {
+  if (!turnId || !childSessionId) return false;
+  const childTimestamp = uuidV7Timestamp(childSessionId);
+  if (childTimestamp === null) return true;
+  const turnTimestamp = uuidV7Timestamp(turnId);
+  if (turnTimestamp !== null) return turnTimestamp >= childTimestamp;
+  const numericStartedAt = Number(startedAt);
+  return Number.isFinite(numericStartedAt) && numericStartedAt >= Math.floor(childTimestamp / 1000);
+}
+
+function forkTurnStartsOwnSession({ childSessionId, replaySessionId, turnId, taskStartedTurnIds, isUserFork }) {
+  // 没有嵌入父 session_meta 时，日志中的第一个 turn_context 通常就是子会话自己的边界。
+  if (!replaySessionId) return true;
+  if (!turnId) return true;
+  const childTimestamp = uuidV7Timestamp(childSessionId);
+  if (childTimestamp === null) return true;
+  const turnTimestamp = uuidV7Timestamp(turnId);
+  if (turnTimestamp === null) return isUserFork || taskStartedTurnIds.has(turnId);
+  if (turnTimestamp > childTimestamp) return true;
+  if (turnTimestamp < childTimestamp) return false;
+  return isUserFork || taskStartedTurnIds.has(turnId);
+}
+
+function tokenEventKey({ scopeId, cumulative, timestamp, usage }) {
+  if (cumulative) {
+    return `codex:${scopeId}:${cumulative.total}:${cumulative.input}:${cumulative.cached}:${cumulative.output}:${cumulative.reasoning}`;
+  }
+  return `codex:${scopeId}:${timestamp || "unknown"}:${usage.total}:${usage.input}:${usage.cached}:${usage.output}:${usage.reasoning}`;
 }
 
 function declaredModel(rowType, payload) {
@@ -107,7 +173,7 @@ function declaredModel(rowType, payload) {
   return String(settings.model || settings.collaboration_mode?.settings?.model || "").trim();
 }
 
-function moveUnknownUsageToModel(model, models, daily) {
+function moveUnknownUsageToModel(model, models, daily, tokenEvents = []) {
   if (!model || model === "未知模型") return;
   const unknownTotal = Number(models["未知模型"] || 0);
   if (unknownTotal > 0) {
@@ -119,6 +185,9 @@ function moveUnknownUsageToModel(model, models, daily) {
     if (unknownDaily <= 0) continue;
     bucket.models[model] = (bucket.models[model] || 0) + unknownDaily;
     delete bucket.models["未知模型"];
+  }
+  for (const event of tokenEvents) {
+    if (event.model === "未知模型") event.model = model;
   }
 }
 
@@ -154,6 +223,7 @@ function subagentInfo(session) {
     threadSource: isSubagent ? "subagent" : String(session?.threadSource || "user"),
     parentThreadId: String(session?.parentThreadId || spawn?.parent_thread_id || ""),
     rootSessionId: String(session?.rootSessionId || ""),
+    forkedFromId: String(session?.forkedFromId || ""),
     agentNickname: String(session?.agentNickname || spawn?.agent_nickname || ""),
     agentPath,
     agentTaskName: String(session?.agentTaskName || taskNameFromAgentPath(agentPath)),
@@ -206,6 +276,7 @@ function collectSessionFiles(codexHome) {
 async function parseSessionFile(filePath) {
   const fileName = path.basename(filePath, ".jsonl");
   let sessionId = fileName;
+  let firstSessionMetaSeen = false;
   let startedAt = null;
   let endedAt = null;
   let cwd = "";
@@ -218,6 +289,14 @@ async function parseSessionFile(filePath) {
   let agentPath = "";
   let agentRole = "";
   let agentDepth = 0;
+  let forkedFromId = "";
+  let forkChildSessionId = "";
+  let forkReplaySessionId = "";
+  let forkReplayActive = false;
+  let forkIsUser = false;
+  let forkInheritedBaseline = null;
+  let forkInheritedReportedTotal = null;
+  let skippedReplayTokenEvents = 0;
   let currentModel = "未知模型";
   let currentTaskStarted = null;
   let activeSeconds = 0;
@@ -226,13 +305,49 @@ async function parseSessionFile(filePath) {
   let userMessages = 0;
   let hasPreviousUsage = false;
   let previousUsage = emptyUsage();
+  let cumulativeTokenStart = null;
+  let cumulativeTokenEnd = null;
   const accumulatedUsage = emptyUsage();
   const daily = {};
   const models = {};
+  const tokenEvents = [];
   const hours = Array.from({ length: 24 }, () => ({ ...emptyUsage(), turns: 0, tools: 0 }));
   const weekdays = Array.from({ length: 7 }, () => ({ ...emptyUsage(), turns: 0, tools: 0 }));
   const toolNames = {};
   const modelTurns = {};
+  const forkTaskStartedTurnIds = new Set();
+  const forkTaskStarts = new Map();
+
+  const startTask = (parts) => {
+    turns += 1;
+    currentTaskStarted = parts?.epoch || null;
+    if (!parts) return;
+    daily[parts.date] ||= emptyBucket();
+    daily[parts.date].turns += 1;
+    hours[parts.hour].turns += 1;
+    weekdays[parts.weekday].turns += 1;
+  };
+
+  const applySessionMeta = (payload, timestamp) => {
+    sessionId = payload.id || payload.session_id || sessionId;
+    startedAt = payload.timestamp || timestamp || startedAt;
+    cwd = payload.cwd || cwd;
+    source = payload.source || source;
+    provider = payload.model_provider || provider;
+    const spawn = payload.source && typeof payload.source === "object"
+      ? payload.source?.subagent?.thread_spawn
+      : null;
+    threadSource = payload.thread_source || (spawn ? "subagent" : threadSource);
+    parentThreadId = payload.parent_thread_id || spawn?.parent_thread_id || parentThreadId;
+    agentNickname = payload.agent_nickname || spawn?.agent_nickname || agentNickname;
+    agentPath = payload.agent_path || spawn?.agent_path || agentPath;
+    agentRole = payload.agent_role || spawn?.agent_role || agentRole;
+    agentDepth = Number(payload.agent_depth ?? spawn?.depth ?? agentDepth);
+    forkedFromId = forkParentId(payload) || forkedFromId;
+    if (forkedFromId && !parentThreadId) parentThreadId = forkedFromId;
+    // 子代理日志中的 session_id 指向根任务，而 id 是当前子代理自己的会话 ID。
+    if (threadSource === "subagent") rootSessionId = payload.root_thread_id || payload.session_id || forkedFromId || rootSessionId;
+  };
 
   const input = fs.createReadStream(filePath, { encoding: "utf8" });
   const lines = readline.createInterface({ input, crlfDelay: Infinity });
@@ -250,42 +365,71 @@ async function parseSessionFile(filePath) {
     const payloadType = payload.type;
 
     if (row.type === "session_meta") {
-      sessionId = payload.id || payload.session_id || sessionId;
-      startedAt = payload.timestamp || timestamp || startedAt;
-      cwd = payload.cwd || cwd;
-      source = payload.source || source;
-      provider = payload.model_provider || provider;
-      const spawn = payload.source && typeof payload.source === "object"
-        ? payload.source?.subagent?.thread_spawn
-        : null;
-      threadSource = payload.thread_source || (spawn ? "subagent" : threadSource);
-      parentThreadId = payload.parent_thread_id || spawn?.parent_thread_id || parentThreadId;
-      agentNickname = payload.agent_nickname || spawn?.agent_nickname || agentNickname;
-      agentPath = payload.agent_path || spawn?.agent_path || agentPath;
-      agentRole = payload.agent_role || spawn?.agent_role || agentRole;
-      agentDepth = Number(payload.agent_depth ?? spawn?.depth ?? agentDepth);
-      // 子代理日志中的 session_id 指向根任务，而 id 是当前子代理自己的会话 ID。
-      if (threadSource === "subagent") rootSessionId = payload.root_thread_id || payload.session_id || rootSessionId;
+      if (!firstSessionMetaSeen) {
+        applySessionMeta(payload, timestamp);
+        firstSessionMetaSeen = true;
+        forkChildSessionId = sessionId;
+        forkReplayActive = Boolean(forkedFromId);
+        forkIsUser = payload.thread_source === "user";
+        continue;
+      }
+      if (forkReplayActive) {
+        if (payload.id && payload.id !== forkChildSessionId) forkReplaySessionId = payload.id;
+        // fork 文件会嵌入父会话的 session_meta，不能让它覆盖子会话身份、项目和设备信息。
+        continue;
+      }
+      if (!payload.id || payload.id === sessionId) applySessionMeta(payload, timestamp);
+      continue;
+    }
+
+    if (forkReplayActive) {
+      if (payloadType === "task_started" && forkTaskStartsOwnSession({
+        childSessionId: forkChildSessionId,
+        turnId: payload.turn_id,
+        startedAt: payload.started_at,
+      })) {
+        forkTaskStartedTurnIds.add(payload.turn_id);
+        forkTaskStarts.set(payload.turn_id, parts);
+      }
+
+      if (row.type === "turn_context" && forkTurnStartsOwnSession({
+        childSessionId: forkChildSessionId,
+        replaySessionId: forkReplaySessionId,
+        turnId: payload.turn_id,
+        taskStartedTurnIds: forkTaskStartedTurnIds,
+        isUserFork: forkIsUser,
+      })) {
+        forkReplayActive = false;
+        const taskParts = forkTaskStarts.get(payload.turn_id);
+        if (taskParts) startTask(taskParts);
+        forkTaskStartedTurnIds.clear();
+        forkTaskStarts.clear();
+      } else {
+        if (payloadType === "token_count" && payload.info?.total_token_usage) {
+          const inherited = tokenValues(payload.info);
+          previousUsage = inherited;
+          hasPreviousUsage = true;
+          forkInheritedBaseline = inherited;
+          const reportedTotal = Number(payload.info.total_token_usage.total_tokens);
+          forkInheritedReportedTotal = Number.isFinite(reportedTotal) && reportedTotal >= 0 ? reportedTotal : inherited.total;
+          skippedReplayTokenEvents += 1;
+        }
+        // fork 开头是父线程完整历史的高速重放；turn、工具和 Token 都不能计入子会话。
+        continue;
+      }
     }
 
     const model = declaredModel(row.type, payload);
     if (model) {
       // 新版 Codex 的子代理在首个 turn_context 之前就会写入累计 Token，
       // 但 thread_settings_applied 已经给出了实际模型；首次识别时要把这些流量回填过去。
-      if (currentModel === "未知模型") moveUnknownUsageToModel(model, models, daily);
+      if (currentModel === "未知模型") moveUnknownUsageToModel(model, models, daily, tokenEvents);
       currentModel = model;
       modelTurns[model] = (modelTurns[model] || 0) + 1;
     }
 
     if (payloadType === "task_started") {
-      turns += 1;
-      currentTaskStarted = parts?.epoch || null;
-      if (parts) {
-        daily[parts.date] ||= emptyBucket();
-        daily[parts.date].turns += 1;
-        hours[parts.hour].turns += 1;
-        weekdays[parts.weekday].turns += 1;
-      }
+      startTask(parts);
     } else if (payloadType === "task_complete" || payloadType === "turn_aborted") {
       if (currentTaskStarted && parts?.epoch && parts.epoch >= currentTaskStarted) {
         const duration = Math.round((parts.epoch - currentTaskStarted) / 1000);
@@ -308,13 +452,66 @@ async function parseSessionFile(filePath) {
         weekdays[parts.weekday].tools += 1;
       }
     } else if (payloadType === "token_count") {
-      const current = tokenValues(payload.info);
-      // 子代理启动时会继承父任务当时的线程累计值。第一条 total_token_usage 的绝大部分
-      // 不是子代理自己消耗的流量，只能把本次请求的 last_token_usage 作为首次增量。
-      // 后续记录继续对累计值做相邻差分，这样既保留真实子代理用量，又不会重复父任务基线。
-      const delta = subagentInfo({ threadSource, source }).isSubagent && !hasPreviousUsage
-        ? lastTokenValues(payload.info)
-        : usageDelta(current, previousUsage);
+      const totalUsage = payload.info?.total_token_usage ? tokenValues(payload.info) : null;
+      const lastUsage = payload.info?.last_token_usage ? lastTokenValues(payload.info) : null;
+
+      if (forkInheritedBaseline) {
+        const reportedTotal = Number(payload.info?.total_token_usage?.total_tokens);
+        const stillInherited = totalUsage && (
+          (Number.isFinite(reportedTotal) && reportedTotal <= forkInheritedReportedTotal)
+          || usageWithin(totalUsage, forkInheritedBaseline)
+        );
+        if (stillInherited) {
+          skippedReplayTokenEvents += 1;
+          continue;
+        }
+        // 没有累计值时无法继续比较继承基线，应信任 last_token_usage 作为真实增量。
+        forkInheritedBaseline = null;
+        forkInheritedReportedTotal = null;
+      }
+
+      let delta = null;
+      let nextPrevious = hasPreviousUsage ? previousUsage : null;
+      if (totalUsage && lastUsage) {
+        if (hasPreviousUsage && sameUsage(totalUsage, previousUsage)) continue;
+        if (hasPreviousUsage && !usageDelta(totalUsage, previousUsage)
+          && looksLikeStaleRegression(totalUsage, previousUsage, lastUsage)) continue;
+        // 热门统计项目均把 last_token_usage 当作真实请求增量；累计值仅用于去重和异常检测。
+        delta = lastUsage;
+        nextPrevious = totalUsage;
+      } else if (totalUsage) {
+        if (hasPreviousUsage && sameUsage(totalUsage, previousUsage)) continue;
+        if (hasPreviousUsage) {
+          delta = usageDelta(totalUsage, previousUsage);
+          if (!delta) {
+            // 缺少 last 时遇到累计重置，只建立新基线，绝不能把整个新累计值再次计入。
+            previousUsage = totalUsage;
+            continue;
+          }
+        } else {
+          delta = totalUsage;
+        }
+        nextPrevious = totalUsage;
+      } else if (lastUsage) {
+        delta = lastUsage;
+        nextPrevious = hasPreviousUsage ? addUsageCopy(previousUsage, lastUsage) : null;
+      }
+
+      if (!delta || delta.total <= 0) continue;
+      if (totalUsage) {
+        if (cumulativeTokenStart === null) cumulativeTokenStart = totalUsage.total;
+        cumulativeTokenEnd = totalUsage.total;
+      }
+      previousUsage = nextPrevious || previousUsage;
+      hasPreviousUsage = Boolean(nextPrevious) || hasPreviousUsage;
+
+      const scopeId = forkedFromId || sessionId;
+      tokenEvents.push({
+        key: tokenEventKey({ scopeId, cumulative: totalUsage, timestamp, usage: delta }),
+        timestamp,
+        model: currentModel,
+        ...delta,
+      });
       addUsage(accumulatedUsage, delta);
       models[currentModel] = (models[currentModel] || 0) + delta.total;
       if (parts) {
@@ -325,8 +522,6 @@ async function parseSessionFile(filePath) {
         addUsage(hours[parts.hour], delta);
         addUsage(weekdays[parts.weekday], delta);
       }
-      previousUsage = current;
-      hasPreviousUsage = true;
     }
   }
 
@@ -366,6 +561,7 @@ async function parseSessionFile(filePath) {
       threadSource,
       parentThreadId,
       rootSessionId,
+      forkedFromId,
       agentNickname,
       agentPath,
       agentTaskName: taskNameFromAgentPath(agentPath),
@@ -377,10 +573,15 @@ async function parseSessionFile(filePath) {
       userMessages,
       activeSeconds,
       wallSeconds,
+      cumulativeTokenStart,
+      cumulativeTokenEnd,
+      tokenEventCount: tokenEvents.length,
+      skippedReplayTokenEvents,
       ...accumulatedUsage,
     },
     daily,
     models,
+    tokenEvents,
     hours,
     weekdays,
     toolNames,
@@ -448,6 +649,7 @@ function decorateResult(raw, source, device, title) {
     },
     daily,
     models: { ...(raw.models || {}) },
+    tokenEvents: Array.isArray(raw.tokenEvents) ? raw.tokenEvents.map((event) => ({ ...event })) : null,
     hours: cloneUsageTimeline(raw.hours, 24),
     weekdays: cloneUsageTimeline(raw.weekdays, 7),
     toolNames: { ...(raw.toolNames || {}) },
@@ -460,9 +662,10 @@ function recordRank(record) {
   const activity = Number(record.session?.turns || 0) + Number(record.session?.tools || 0);
   const activeDays = Object.values(record.daily || {}).filter((bucket) => Number(bucket?.total || 0) > 0).length;
   const canonical = record.session?.isCanonicalLog ? 1 : 0;
+  const eventSchema = Array.isArray(record.tokenEvents) ? 1 : 0;
   // 同一 ID 的快照副本可能总量略大，却把历史累计量全部记在复制当天。
-  // 因此优先选择持续追加的主日志，其次比较覆盖天数、Token、活动记录和结束时间。
-  return [canonical, activeDays, total, activity, ended];
+  // 因此优先选择具备事件级明细的新版记录和持续追加的主日志，再比较覆盖天数与完整度。
+  return [eventSchema, canonical, activeDays, total, activity, ended];
 }
 
 function isRecordNewer(candidate, current) {
@@ -474,6 +677,67 @@ function isRecordNewer(candidate, current) {
   return false;
 }
 
+function clearBucketUsage(bucket) {
+  const result = cloneBucket(bucket);
+  for (const key of USAGE_KEYS) result[key] = 0;
+  result.models = {};
+  result.projects = {};
+  result.hours = {};
+  return result;
+}
+
+function clearTimelineUsage(timeline, length) {
+  return cloneUsageTimeline(timeline, length).map((bucket) => {
+    for (const key of USAGE_KEYS) bucket[key] = 0;
+    return bucket;
+  });
+}
+
+function rebuildRecordUsage(record, seenTokenEvents) {
+  if (!Array.isArray(record.tokenEvents)) return { record, duplicateTokenEvents: 0, acceptedTokenEvents: null };
+
+  const rebuilt = {
+    ...record,
+    session: { ...record.session },
+    daily: Object.fromEntries(Object.entries(record.daily || {}).map(([date, bucket]) => [date, clearBucketUsage(bucket)])),
+    models: {},
+    tokenEvents: [],
+    hours: clearTimelineUsage(record.hours, 24),
+    weekdays: clearTimelineUsage(record.weekdays, 7),
+    toolNames: { ...(record.toolNames || {}) },
+  };
+  for (const key of USAGE_KEYS) rebuilt.session[key] = 0;
+
+  let duplicateTokenEvents = 0;
+  for (const event of record.tokenEvents) {
+    if (event.key && seenTokenEvents.has(event.key)) {
+      duplicateTokenEvents += 1;
+      continue;
+    }
+    if (event.key) seenTokenEvents.add(event.key);
+    const usage = Object.fromEntries(USAGE_KEYS.map((key) => [key, Number(event?.[key] || 0)]));
+    rebuilt.tokenEvents.push({ ...event, ...usage });
+    addUsage(rebuilt.session, usage);
+    rebuilt.models[event.model || "未知模型"] = (rebuilt.models[event.model || "未知模型"] || 0) + usage.total;
+    const parts = localParts(event.timestamp);
+    if (!parts) continue;
+    rebuilt.daily[parts.date] ||= emptyBucket();
+    addUsage(rebuilt.daily[parts.date], usage);
+    rebuilt.daily[parts.date].models[event.model || "未知模型"] = (rebuilt.daily[parts.date].models[event.model || "未知模型"] || 0) + usage.total;
+    rebuilt.daily[parts.date].hours[parts.hour] = (rebuilt.daily[parts.date].hours[parts.hour] || 0) + usage.total;
+    addUsage(rebuilt.hours[parts.hour], usage);
+    addUsage(rebuilt.weekdays[parts.weekday], usage);
+  }
+
+  rebuilt.session.tokenEventCount = rebuilt.tokenEvents.length;
+  rebuilt.session.model = Object.entries(rebuilt.models).sort((left, right) => right[1] - left[1])[0]?.[0]
+    || rebuilt.session.model;
+  for (const bucket of Object.values(rebuilt.daily)) {
+    bucket.projects[rebuilt.session.project] = bucket.total;
+  }
+  return { record: rebuilt, duplicateTokenEvents, acceptedTokenEvents: rebuilt.tokenEvents.length };
+}
+
 function dedupeRecords(records) {
   const uniqueSessions = new Map();
   for (const record of records) {
@@ -483,9 +747,32 @@ function dedupeRecords(records) {
     if (!current || isRecordNewer(record, current)) uniqueSessions.set(id, record);
   }
 
+  const selected = [...uniqueSessions.values()];
+  const claimOrder = [...selected].sort((left, right) => {
+    if (isRecordNewer(left, right)) return -1;
+    if (isRecordNewer(right, left)) return 1;
+    return String(left.session?.id || "").localeCompare(String(right.session?.id || ""));
+  });
+  const seenTokenEvents = new Set();
+  const rebuiltById = new Map();
+  let duplicateTokenEvents = 0;
+  let fullyDuplicateSessions = 0;
+  for (const record of claimOrder) {
+    const rebuilt = rebuildRecordUsage(record, seenTokenEvents);
+    duplicateTokenEvents += rebuilt.duplicateTokenEvents;
+    const hadTokenEvents = Array.isArray(record.tokenEvents) && record.tokenEvents.length > 0;
+    const forked = Boolean(record.session?.forkedFromId) || subagentInfo(record.session).isSubagent;
+    if (hadTokenEvents && rebuilt.acceptedTokenEvents === 0 && forked) {
+      fullyDuplicateSessions += 1;
+      continue;
+    }
+    rebuiltById.set(record.session.id, rebuilt.record);
+  }
+  const dedupedRecords = selected.map((record) => rebuiltById.get(record.session.id)).filter(Boolean);
   return {
-    records: [...uniqueSessions.values()],
-    duplicateSessions: Math.max(0, records.length - uniqueSessions.size),
+    records: dedupedRecords,
+    duplicateSessions: Math.max(0, records.length - selected.length) + fullyDuplicateSessions,
+    duplicateTokenEvents,
   };
 }
 
@@ -497,12 +784,41 @@ function mergeHourOrWeek(target, source) {
   });
 }
 
+function compactTokenEvent(event) {
+  return [
+    event?.key || "",
+    event?.timestamp || null,
+    event?.model || "未知模型",
+    Number(event?.input || 0),
+    Number(event?.cached || 0),
+    Number(event?.output || 0),
+    Number(event?.reasoning || 0),
+    Number(event?.total || 0),
+  ];
+}
+
+function expandTokenEvent(event) {
+  if (!Array.isArray(event)) return { ...event };
+  return {
+    key: event[0] || "",
+    timestamp: event[1] || null,
+    model: event[2] || "未知模型",
+    input: Number(event[3] || 0),
+    cached: Number(event[4] || 0),
+    output: Number(event[5] || 0),
+    reasoning: Number(event[6] || 0),
+    total: Number(event[7] || 0),
+  };
+}
+
 function sessionWithBreakdown(record) {
   return {
     ...record.session,
     breakdown: {
       daily: Object.fromEntries(Object.entries(record.daily || {}).map(([date, bucket]) => [date, cloneBucket(bucket)])),
       models: { ...(record.models || {}) },
+      // 远程同步会携带事件级明细；使用定长数组可显著减少 JSON 字段名造成的网络体积。
+      tokenEvents: Array.isArray(record.tokenEvents) ? record.tokenEvents.map(compactTokenEvent) : null,
       hours: cloneUsageTimeline(record.hours, 24),
       weekdays: cloneUsageTimeline(record.weekdays, 7),
       toolNames: { ...(record.toolNames || {}) },
@@ -516,6 +832,9 @@ function recordFromSession(session) {
     session: { ...session, breakdown: undefined },
     daily: Object.fromEntries(Object.entries(session.breakdown.daily).map(([date, bucket]) => [date, cloneBucket(bucket)])),
     models: { ...(session.breakdown.models || {}) },
+    tokenEvents: Array.isArray(session.breakdown.tokenEvents)
+      ? session.breakdown.tokenEvents.map(expandTokenEvent)
+      : null,
     hours: cloneUsageTimeline(session.breakdown.hours, 24),
     weekdays: cloneUsageTimeline(session.breakdown.weekdays, 7),
     toolNames: { ...(session.breakdown.toolNames || {}) },
@@ -559,6 +878,7 @@ function summarizeRecords(records, metadata = {}) {
     filesScanned: Number(metadata.filesScanned || 0),
     reparsedFiles: Number(metadata.reparsedFiles || 0),
     duplicateSessions: deduped.duplicateSessions + Number(metadata.duplicateSessions || 0),
+    duplicateTokenEvents: deduped.duplicateTokenEvents + Number(metadata.duplicateTokenEvents || 0),
     dedupeMode: metadata.dedupeMode || "exact",
     codexHome: metadata.codexHome || metadata.source?.path || "",
     device: metadata.device || null,
@@ -596,19 +916,21 @@ function mergeLegacyStats(target, legacy) {
   target.filesScanned += Number(legacy.filesScanned || 0);
   target.reparsedFiles += Number(legacy.reparsedFiles || 0);
   target.duplicateSessions += Number(legacy.duplicateSessions || 0);
+  target.duplicateTokenEvents += Number(legacy.duplicateTokenEvents || 0);
 }
 
 function combineStatsData(statsRows, metadata = {}) {
   const exactRecords = [];
   const legacyRows = [];
-  let subagentBaselineLimited = false;
+  let tokenEventDedupeLimited = false;
   for (const stats of statsRows.filter(Boolean)) {
     const sessions = stats.sessions || [];
     // 版本 4 已具备会话级日统计，可以在汇总端继续按会话 ID 精确去重。
     const exact = Number(stats.schemaVersion || 0) >= EXACT_BREAKDOWN_SCHEMA_VERSION && sessions.every((session) => session?.breakdown?.daily);
     if (exact) {
       exactRecords.push(...sessions.map(recordFromSession).filter(Boolean));
-      if (Number(stats.schemaVersion || 0) < SUBAGENT_BASELINE_SCHEMA_VERSION) subagentBaselineLimited = true;
+      if (Number(stats.schemaVersion || 0) < TOKEN_EVENT_SCHEMA_VERSION
+        || sessions.some((session) => !Array.isArray(session?.breakdown?.tokenEvents))) tokenEventDedupeLimited = true;
     } else {
       // 旧版远程端没有会话级日统计，无法安全地从总数中减掉重复会话，只能兼容性相加。
       legacyRows.push(stats);
@@ -619,7 +941,8 @@ function combineStatsData(statsRows, metadata = {}) {
     filesScanned: statsRows.reduce((sum, stats) => sum + Number(stats?.filesScanned || 0), 0),
     reparsedFiles: statsRows.reduce((sum, stats) => sum + Number(stats?.reparsedFiles || 0), 0),
     duplicateSessions: statsRows.reduce((sum, stats) => sum + Number(stats?.duplicateSessions || 0), 0),
-    dedupeMode: legacyRows.length || subagentBaselineLimited ? "partial" : "exact",
+    duplicateTokenEvents: statsRows.reduce((sum, stats) => sum + Number(stats?.duplicateTokenEvents || 0), 0),
+    dedupeMode: legacyRows.length || tokenEventDedupeLimited ? "partial" : "exact",
   });
   for (const legacy of legacyRows) mergeLegacyStats(result, legacy);
   return result;

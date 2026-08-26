@@ -1,0 +1,38 @@
+Codex 流量统计 Windows 版使用说明
+=================================
+
+文件：Codex流量统计-Windows-v2.4.0.7z
+
+一、发送到 Windows
+1. 右键 7z 文件，可使用 Tailscale 的“发送文件”传到 Windows 电脑。
+2. Windows 收到后，用 7-Zip 解压到桌面或固定目录。
+
+二、启动
+1. 打开解压后的文件夹，双击“Codex 流量统计.exe”。
+2. 该目录必须整体保留，不能只把 EXE 单独移走；也可以给 EXE 创建桌面快捷方式。
+3. 这是本地自制程序，当前没有购买 Windows 代码签名证书。
+4. 如果 Microsoft Defender SmartScreen 提示“无法识别的应用”，请先确认文件来源和校验值，再选择“更多信息 → 仍要运行”。
+5. 如果 Windows 防火墙询问是否允许网络访问，请允许 Tailscale/专用网络访问，否则 Ubuntu 无法读取 Windows 的统计结果。
+
+Windows 压缩包的 SHA-256：
+1b65bd134ab2fe4159fff66e97e89f67a8bf0f81f026e1aedb6b2c65cc4ca849
+
+三、连接 Ubuntu
+1. 确认 Windows 和 Ubuntu 的 Tailscale 都在线。
+2. 在 Windows 应用中点击“来源与同步”。
+3. 复制 Windows 显示的“Tailscale 地址”和“本机访问令牌”。
+4. 回到 Ubuntu 应用，点击“来源与同步 → 添加设备”。
+5. 名称可填“Windows 电脑”，粘贴地址和令牌，然后点击“保存并连接”。
+6. 刷新后，设备筛选中可以分别查看 Ubuntu、Windows 和全部设备。
+
+四、2.4.0 统计口径
+- fork/side 日志开头重放的父会话历史不会再重复计入。
+- 优先统计每条 last_token_usage，累计值只用于去重和异常检查。
+- Ctrl-C 中止 side 对话后，已经写入日志的真实 Token 仍会统计。
+- Ubuntu 与 Windows 都升级到 2.4.0 后，跨设备才能进行事件级精确去重。
+
+五、注意
+- 同一个 OpenAI 密钥不会自动合并两台电脑的本地日志；应用通过 Tailscale 汇总两台电脑各自的 .codex 日志。
+- Windows 电脑关机、应用关闭或 Tailscale 离线时，Ubuntu 只显示本机数据。
+- 同步只传输统计结果和会话元数据，不传输提示词正文、模型回复正文、API 密钥或登录凭据。
+- 不要把应用的 18765 端口映射到公网。

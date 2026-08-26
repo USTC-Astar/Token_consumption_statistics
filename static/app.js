@@ -502,7 +502,8 @@ function renderSessions() {
     const title = sessionDisplayTitle(row);
     const agent = sessionAgentInfo(row);
     const visibleTitle = child ? [agent.nickname, agent.taskName].filter(Boolean).join(" · ") || title : title;
-    const agentTag = child ? '<span class="subagent-tag">子代理</span>' : "";
+    const mergedCount = Math.max(0, Number(row.duplicateBatchSize || 1) - 1);
+    const agentTag = child ? `<span class="subagent-tag">${mergedCount ? `子代理 · 已合并 ${mergedCount} 条重复镜像` : "子代理"}</span>` : "";
     return `<tr class="${child ? "subagent-row" : ""}"><td><div class="device-tag">${escapeHtml(row.originName || [row.deviceName, row.sourceName].filter(Boolean).join(" · "))}</div><div class="session-title-wrap">${agentTag}<div class="session-name" title="${escapeHtml(title)}">${escapeHtml(visibleTitle)}</div></div></td><td>${localDate(row.startedAt)}</td><td>${escapeHtml(row.project)}</td><td><span class="model-pill">${escapeHtml(row.model)}</span></td><td>${short(Math.max(0, row.input - row.cached))}</td><td>${short(row.cached)}</td><td>${short(row.output)}</td><td>${duration(row.activeSeconds)}</td><td><strong>${short(row.total)}</strong></td></tr>`;
   };
   const html = ordered.map((entry) => {
@@ -535,7 +536,9 @@ function render() {
   renderRanking("#toolRanking", sortedMap(sum.toolNames), number);
   renderActivity(rows); renderInsights(rows); renderDailyDetails(); renderSessions();
   const aggregate = state.snapshot.aggregate || state.snapshot.local;
-  const dedupeText = aggregate.dedupeMode === "partial" ? "部分设备版本较旧，跨设备去重或子代理基线扣除受限，请升级到最新版" : `已排除 ${number(aggregate.duplicateSessions)} 个重复会话副本`;
+  const dedupeText = aggregate.dedupeMode === "partial"
+    ? "部分设备版本较旧，缺少事件级明细；跨设备与 fork 重放只能部分去重，请升级到最新版"
+    : `已排除 ${number(aggregate.duplicateSessions)} 个重复会话、${number(aggregate.duplicateTokenEvents)} 条重复 Token 事件`;
   document.querySelector("#subtitle").textContent = `${periodLabel()} · ${devices().length} 个数据源 · ${state.snapshot.local.filesScanned} 个本地日志 · ${dedupeText}`;
 }
 
